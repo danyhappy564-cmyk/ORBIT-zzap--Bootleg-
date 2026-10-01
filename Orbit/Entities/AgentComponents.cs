@@ -85,6 +85,7 @@ public class Movement
 
     public int CurrentCorner;
     public int Retry;
+    public int PathRevision;
 
     public float Speed = 1f;
     public float Pose = 1f;
@@ -96,6 +97,17 @@ public class Movement
     /// interaction is in flight and the open animation is cancelled if the bot keeps
     /// pushing forward through the doorway.</summary>
     public float DoorInteractHoldUntil = -1f;
+    internal readonly Orbit.Systems.NearbyDoorCache GhostDoors = new();
+
+    /// <summary>Next local route check. Door candidates are cached for two seconds separately.</summary>
+    public float NextGhostDoorCheck;
+
+    // Ghost gait stand-ins for what an inactive body cannot report (see MovementSystem.GhostCanSprint):
+    // seconds of sprint left, the exhausted latch, and a throttled roof check replacing the environment id.
+    public float GhostStamina = 14f;
+    public bool GhostExhausted;
+    public bool GhostIndoors;
+    public float NextGhostIndoorCheck;
 
     public bool HasPath
     {
@@ -140,6 +152,8 @@ public class HardStuck
     // geometry escapes instead of landing nearby and re-wedging.
     public int TeleportCount;
     public Vector3 LastTeleportPos;
+    // Consecutive hard-stuck rescues with no destination reached in between (see MovementSystem.ReportRescueLoop).
+    public int RescueStreak;
 
     public override string ToString()
     {
@@ -170,6 +184,7 @@ public class SoftStuck
 
 public class Stuck
 {
+    internal readonly Orbit.Systems.OrbitMovementRecovery Recovery = new();
     public readonly TimePacing Pacing = new(0.1f);
 
     public HardStuck Hard = new();
@@ -177,10 +192,12 @@ public class Stuck
 
     // Idle-island rescue: a bot on a navmesh chunk disconnected from the map can never path anywhere, and the
     // per-agent stuck remediation never sees it (no path means UpdateMovement early-returns), so this is a
-    // separate one-shot watchdog tracked on the bot's real position, independent of move-speed.
+    // separate watchdog tracked on the bot's real position, independent of move-speed and short retries.
     public Vector3 IdleRescueAnchor;
     public float IdleRescueSince = -1f; // -1 = not tracking
-    public bool IdleRescued;
+    public float IdleRescueLastObservedAt = -1f;
+    public bool IdleRescueIntent;
+    internal readonly Orbit.Systems.LocalEscapeSearch LocalEscape = new();
 
     // Spawn-island rescue: keys off being parked near spawn while unable to path to any other agent, since such a
     // bot still "arrives" at its few on-island waypoints (so the idle-island watchdog above can't catch it).
@@ -190,6 +207,12 @@ public class Stuck
     public bool SpawnIslandRescued;
     public int SpawnIslandAttempts;
     public float SpawnIslandNextProbeAt;
+    public int SpawnIslandWaypointCursor;
+    internal readonly Orbit.Systems.SpawnRescueProgress SpawnProgress = new();
+    public float SpawnIslandDisconnectedSince = -1f;
+
+    // Ghost rescue: consecutive PathInvalid results while dormant (see MovementSystem.TrackGhostPathInvalid).
+    public int GhostInvalidPathStreak;
 
     public override string ToString() => $"Stuck(soft: {Soft} hard: {Hard})";
 }

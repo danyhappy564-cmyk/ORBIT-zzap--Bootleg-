@@ -36,13 +36,16 @@ public class OrbitServerConfig
 /// </summary>
 public class GhostModeConfig
 {
+    public bool WakeForSpectators { get; set; } = true;
     // ON by default — decided after the 2.0 RC: unanimous community feedback, and the limiter is
     // the release's headline feature. Release notes call it out with where to turn it off.
     public bool Enabled { get; set; } = true;
     public bool GhostMovement { get; set; } = true;
+    public bool NativeGhostMovement { get; set; } = true;
     // "simulated" (statistical resolution, zero cost) | "real" (wake both units on contact and let
     // the AI fight it out) | "off" (ghosts ignore each other).
     public string GhostFightsMode { get; set; } = "simulated";
+    public string GhostAwakeBehavior { get; set; } = "sleep_awake";
     // Audible distant gunfire when a simulated fight resolves (the fighters' real weapon sounds).
     public bool GhostFightSounds { get; set; } = true;
 
@@ -68,6 +71,39 @@ public class GhostModeConfig
     // ON (default): sleeping ORBIT squads keep looting along their routes. OFF: sleepers walk past
     // everything and the loot waits for the players.
     public bool GhostLooting { get; set; } = true;
+    // Sleeping squads hear real and simulated firefights. PMC odds follow personality;
+    // other supported bots use their category, with UNTAR/RUAF limited to hunters.
+    public bool GhostHearing { get; set; } = true;
+    // Hearing ranges belong to the listening group, independently of investigation odds.
+    public float GhostHearingPlayersRange { get; set; } = 350f;
+    public float GhostHearingPlayersSuppressedRange { get; set; } = 120f;
+    public float GhostHearingVanillaRange { get; set; } = 200f;
+    public float GhostHearingVanillaSuppressedRange { get; set; } = 80f;
+    public float GhostHearingFactionsRange { get; set; } = 350f;
+    public float GhostHearingFactionsSuppressedRange { get; set; } = 120f;
+    public int GhostHearingMinShots { get; set; } = 4;
+    public float GhostHearingCooldownSeconds { get; set; } = 150f;
+    public float GhostHearingMemorySeconds { get; set; } = 45f;
+    public float GhostHearingClusterRadius { get; set; } = 60f;
+    // Base investigation odds in percent; distance still reduces the final roll.
+    public int GhostHearingVeryAggressivePct { get; set; } = 85;
+    public int GhostHearingAggressivePct { get; set; } = 60;
+    public int GhostHearingAveragePct { get; set; } = 30;
+    public int GhostHearingCautiousPct { get; set; } = 8;
+    public int GhostHearingTimmyPct { get; set; } = 3;
+    public int GhostHearingPlayerScavPct { get; set; } = 20;
+    public int GhostHearingScavPct { get; set; } = 30;
+    public int GhostHearingGoonsPct { get; set; } = 75;
+    public int GhostHearingBossesPct { get; set; } = 30;
+    public int GhostHearingCultistsPct { get; set; } = 0;
+    public int GhostHearingRaidersPct { get; set; } = 50;
+    public int GhostHearingRoguesPct { get; set; } = 50;
+    public int GhostHearingBloodhoundsPct { get; set; } = 50;
+    public int GhostHearingUntarRuafHuntersPct { get; set; } = 50;
+    public int GhostHearingRoguesVsRaidersPct { get; set; } = 50;
+    public int GhostHearingArmyOfTwoPct { get; set; } = 75;
+    public int GhostHearingIsbPct { get; set; } = 75;
+    public int GhostHearingBlackDivisionPct { get; set; } = 75;
     // "rare" | "normal" | "frequent": scales the ghost-fight contact odds and the per-pair cooldown.
     public string GhostFightFrequency { get; set; } = "normal";
     // 0.5 to 2.0: casualty multiplier for simulated fights (0.5 = often bloodless, 2 = bloodbaths).
@@ -94,6 +130,7 @@ public class FactionsConfig
     public bool VanillaGoons { get; set; }
     public bool VanillaCultists { get; set; }
     public bool VanillaRaiders { get; set; } = true;
+    public bool VanillaRogues { get; set; } = true;
     public bool VanillaBloodhounds { get; set; }
 
     // Percentage of each faction's squads that roll permission to leave their spawn area and use

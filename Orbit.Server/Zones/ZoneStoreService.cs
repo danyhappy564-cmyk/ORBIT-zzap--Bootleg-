@@ -6,19 +6,20 @@ using SPTarkov.DI.Annotations;
 namespace Orbit.Server.Zones;
 
 /// <summary>
-/// Owns the server-side per-map advection zones (hotspots). Files live in user/mods/ORBIT/zones/,
-/// seeded on first access from embedded defaults (a copy of the client's compiled-in zone JSONs).
-/// The web UI zone editor edits these; the client fetches the whole set via /orbit/zones at boot and
-/// raid start and overrides its local Config/Maps/Zones files with them.
+/// Per-map editor working copies, native metadata and legacy zone-file migration. PresetService
+/// supplies saved snapshots after initialization; zones/*.json remain compatibility copies.
+/// Embedded defaults mirror the client's compiled-in zones. The client fetches the active preset's
+/// maps via /orbit/zones at boot and raid start.
 /// </summary>
 [Injectable(InjectionType.Singleton)]
-public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
+public partial class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
 {
+    public string ModDirectory { get; init; } = Path.GetDirectoryName(typeof(ZoneStoreService).Assembly.Location)!;
     // ORBIT map ids (BSG location ids as the client sees them).
     public static readonly string[] MapIds =
     [
-        "bigmap", "factory4_day", "factory4_night", "Interchange", "laboratory", "Labyrinth",
-        "Lighthouse", "RezervBase", "Sandbox", "Sandbox_high", "Shoreline", "TarkovStreets", "Woods",
+        "bigmap", "factory4_day", "factory4_night", "Interchange", "Interchange@rework", "laboratory", "Labyrinth",
+        "Lighthouse", "Lighthouse@rework", "RezervBase", "Sandbox", "Sandbox_high", "Shoreline", "TarkovStreets", "Woods",
     ];
 
     public static readonly Dictionary<string, string> MapLabels = new()
@@ -27,9 +28,11 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
         ["factory4_day"] = "Factory (day)",
         ["factory4_night"] = "Factory (night)",
         ["Interchange"] = "Interchange",
+        ["Interchange@rework"] = "Interchange (1.0 rework)",
         ["laboratory"] = "The Lab",
         ["Labyrinth"] = "Labyrinth",
         ["Lighthouse"] = "Lighthouse",
+        ["Lighthouse@rework"] = "Lighthouse (1.0 rework)",
         ["RezervBase"] = "Reserve",
         ["Sandbox"] = "Ground Zero",
         ["Sandbox_high"] = "Ground Zero (21+)",
@@ -37,6 +40,15 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
         ["TarkovStreets"] = "Streets of Tarkov",
         ["Woods"] = "Woods",
     };
+
+    /// <summary>"Interchange@rework" -> "Interchange": map reworks that keep BSG's location id are keyed
+    /// "{id}@{variant}" (detected per raid by the client); the base id serves display-only data such as
+    /// the baked BotZone positions.</summary>
+    public static string BaseMapId(string mapId)
+    {
+        var at = mapId.IndexOf('@');
+        return at < 0 ? mapId : mapId[..at];
+    }
 
     // Client-contract serialization: exact member names (see ZoneModels.cs).
     private static readonly JsonSerializerOptions _json = new()
@@ -49,8 +61,7 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
     {
         get
         {
-            var modDir = Path.GetDirectoryName(typeof(ZoneStoreService).Assembly.Location)!;
-            return Path.Combine(modDir, "zones");
+            return Path.Combine(ModDirectory, "zones");
         }
     }
 
@@ -59,17 +70,39 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
     /// <summary>Zones for one map: the saved file, seeded from the embedded default on first access.</summary>
     public MapZoneModel GetZones(string mapId)
     {
+        lock (_working) return GetZonesLocked(mapId);
+    }
+
+    private MapZoneModel GetZonesLocked(string mapId)
+    {
+        if (_presetSaved != null) return NormalizeSnapshot(mapId, _presetSaved[mapId]);
         try
         {
             var path = PathFor(mapId);
             if (!File.Exists(path))
             {
                 var seed = ReadEmbeddedDefault(mapId);
+                NormalizeNativeFloors(mapId, seed);
                 Directory.CreateDirectory(ZonesDir);
                 File.WriteAllText(path, JsonSerializer.Serialize(seed, _json));
                 return seed;
             }
-            return JsonSerializer.Deserialize<MapZoneModel>(File.ReadAllText(path), _json) ?? new MapZoneModel();
+            var loaded = JsonSerializer.Deserialize<MapZoneModel>(File.ReadAllText(path), _json) ?? new MapZoneModel();
+            if (NormalizeNativeFloors(mapId, loaded))
+            {
+                try
+                {
+                    BackupBeforeNativeMigration(path);
+                    Save(mapId, loaded);
+                    logger.Info($"[ORBIT] ZONE MIGRATION: map={mapId} native floors updated; original retained in .pre-native-floors.bak");
+                }
+                catch (Exception ex)
+                {
+                    // A read-only install must not replace valid personal tuning with shipped defaults.
+                    logger.Error($"[ORBIT] ZONE MIGRATION: map={mapId} save failed: {ex.Message}; migrated settings kept in memory");
+                }
+            }
+            return loaded;
         }
         catch (Exception ex)
         {
@@ -80,9 +113,15 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
 
     public void Save(string mapId, MapZoneModel zones)
     {
-        Directory.CreateDirectory(ZonesDir);
-        File.WriteAllText(PathFor(mapId), JsonSerializer.Serialize(zones, _json));
-        logger.Info($"[ORBIT] Zones saved for {mapId}");
+        lock (_working)
+        {
+            NormalizeNativeFloors(mapId, zones);
+            Directory.CreateDirectory(ZonesDir);
+            var path = PathFor(mapId);
+            File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(zones, _json));
+            File.Move(path + ".tmp", path, overwrite: true);
+            logger.Info($"[ORBIT] Zones saved for {mapId}");
+        }
     }
 
     /// <summary>Rewrites the map's file from the embedded default and returns the fresh model.</summary>
@@ -117,7 +156,11 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
     {
         lock (_working)
         {
-            if (_working.TryGetValue(mapId, out var working)) return working;
+            if (_working.TryGetValue(mapId, out var working))
+            {
+                NormalizeNativeFloors(mapId, working);
+                return working;
+            }
             var loaded = GetZones(mapId);
             _working[mapId] = loaded;
             _workingSavedJson[mapId] = JsonSerializer.Serialize(loaded, _json);
@@ -168,18 +211,89 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
         ZonesReplaced?.Invoke();
     }
 
-    /// <summary>Resets the map to shipped defaults, persists, refreshes the working copy.</summary>
+    /// <summary>Reset is an ordinary unsaved edit, including while editing a protected preset.</summary>
     public MapZoneModel ResetWorkingToDefault(string mapId)
     {
         MapZoneModel seed;
         lock (_working)
         {
-            seed = ResetToDefault(mapId);
+            GetWorking(mapId);
+            seed = ReadEmbeddedDefault(mapId);
             _working[mapId] = seed;
-            _workingSavedJson[mapId] = JsonSerializer.Serialize(seed, _json);
         }
         ZonesReplaced?.Invoke();
         return seed;
+    }
+
+    // ── Sibling maps (same layout, separate zone file) ─────────────────
+
+    /// <summary>Maps that share a layout with another one and are tuned in a separate file: Ground Zero and
+    /// its 21+ twin, a vanilla map and its 1.0 rework. Both directions.</summary>
+    private static readonly Dictionary<string, string> _siblings = new()
+    {
+        ["Sandbox"] = "Sandbox_high",
+        ["Sandbox_high"] = "Sandbox",
+        ["Interchange"] = "Interchange@rework",
+        ["Interchange@rework"] = "Interchange",
+        ["Lighthouse"] = "Lighthouse@rework",
+        ["Lighthouse@rework"] = "Lighthouse",
+    };
+
+    public static string? SiblingOf(string mapId) => _siblings.TryGetValue(mapId, out var sibling) ? sibling : null;
+
+    /// <summary>Overwrites the target map's WORKING copy with a deep copy of the source's (unsaved: it rides
+    /// the unsaved-changes button and the undo history like any other edit). Built-in zone names the target
+    /// layout does not have are kept in the file and ignored by the game.</summary>
+    public void CopyWorking(string fromMapId, string toMapId)
+    {
+        var source = GetWorking(fromMapId);
+        GetWorking(toMapId); // seeds the target's saved-state snapshot so the copy shows as pending
+        var clone = JsonSerializer.Deserialize<MapZoneModel>(JsonSerializer.Serialize(source, _json), _json) ?? new MapZoneModel();
+        NormalizeNativeFloors(toMapId, clone);
+        lock (_working)
+        {
+            _working[toMapId] = clone;
+        }
+        ZonesReplaced?.Invoke();
+    }
+
+    // ── Edit history support (EditHistoryService) ──────────────────────
+
+    /// <summary>Current and last-saved JSON of every working copy. The saved one is the baseline the history
+    /// adopts for a map it sees for the first time: a map can enter the working set already modified (pack
+    /// import), and that modification must stay undoable.</summary>
+    public Dictionary<string, (string Current, string Saved)> SnapshotWorking()
+    {
+        lock (_working)
+        {
+            var result = new Dictionary<string, (string, string)>();
+            foreach (var kv in _working)
+            {
+                var current = JsonSerializer.Serialize(kv.Value, _json);
+                result[kv.Key] = (current, _workingSavedJson.TryGetValue(kv.Key, out var saved) ? saved : current);
+            }
+            return result;
+        }
+    }
+
+    /// <summary>Puts working copies back to the given JSON (undo / redo). Only the maps that actually differ
+    /// are replaced, so the editor keeps its instances, and its selection, everywhere else.</summary>
+    public void RestoreWorking(IReadOnlyDictionary<string, string> jsonByMap)
+    {
+        var replaced = false;
+        lock (_working)
+        {
+            foreach (var kv in jsonByMap)
+            {
+                if (_working.TryGetValue(kv.Key, out var current) && JsonSerializer.Serialize(current, _json) == kv.Value) continue;
+                var restored = JsonSerializer.Deserialize<MapZoneModel>(kv.Value, _json);
+                if (restored == null) continue;
+                NormalizeNativeFloors(kv.Key, restored);
+                _working[kv.Key] = restored;
+                replaced = true;
+            }
+        }
+        if (replaced) ZonesReplaced?.Invoke();
     }
 
     // ── Zone packs (export / import, "ORBIT addons" on the Forge) ──────
@@ -224,6 +338,7 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
                 continue;
             }
             Sanitize(kv.Value);
+            NormalizeNativeFloors(kv.Key, kv.Value);
             GetWorking(kv.Key); // seed the saved-state snapshot so the diff shows as pending
             lock (_working)
             {
@@ -255,6 +370,7 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
             ClampRange(cz.Radius, 10f, 2000f);
             ClampRange(cz.Force, -10f, 10f);
             cz.Decay = Math.Clamp(cz.Decay, 0.05f, 20f);
+            cz.Name = string.IsNullOrWhiteSpace(cz.Name) ? null : cz.Name.Trim()[..Math.Min(cz.Name.Trim().Length, 40)];
         }
         if (zones.Convergence != null)
         {
@@ -273,7 +389,11 @@ public class ZoneStoreService(ISptLogger<ZoneStoreService> logger)
             {
                 using var reader = new StreamReader(stream);
                 var parsed = JsonSerializer.Deserialize<MapZoneModel>(reader.ReadToEnd(), _json);
-                if (parsed != null) return parsed;
+                if (parsed != null)
+                {
+                    NormalizeNativeFloors(mapId, parsed);
+                    return parsed;
+                }
             }
         }
         catch (Exception ex)

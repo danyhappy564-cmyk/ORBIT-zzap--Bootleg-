@@ -45,6 +45,7 @@ public class OrbitBrainLayer : CustomLayer
     private const string SainCombatLayerName = "SAIN : Combat Layer";
     private bool _sainCombatActive;
     private float _sainCombatEndedAt = float.NegativeInfinity;
+    private float _nextHandoffWarningAt;
 
     // Diag throttling — log gate state on transition and every 5s if off.
     private bool _lastIsActive = true;
@@ -60,7 +61,9 @@ public class OrbitBrainLayer : CustomLayer
     private static bool _vanillaGoons;
     private static bool _vanillaCultists;
     private static bool _vanillaRaiders;
+    private static bool _vanillaRogues;
     private static bool _vanillaBloodhounds;
+    internal static bool LegacyUntarHunts { get; set; }
 
     public static void AddExcludedRoleSubstring(string sub)
     {
@@ -71,28 +74,53 @@ public class OrbitBrainLayer : CustomLayer
     public static void SetVanillaGoonExclusion(bool excluded) => _vanillaGoons = excluded;
     public static void SetVanillaCultistExclusion(bool excluded) => _vanillaCultists = excluded;
     public static void SetVanillaRaiderExclusion(bool excluded) => _vanillaRaiders = excluded;
+    public static void SetVanillaRogueExclusion(bool excluded) => _vanillaRogues = excluded;
     public static void SetVanillaBloodhoundExclusion(bool excluded) => _vanillaBloodhounds = excluded;
+
+    /// <summary>The spawn id of a MoreBotsAPI hunt squad member, null for everything else.</summary>
+    private static string HuntSpawnId(BotOwner botOwner)
+    {
+        try
+        {
+            var id = botOwner?.SpawnProfileData?.SpawnParams?.Id_spawn;
+            return id != null && id.IndexOf("hunt", StringComparison.OrdinalIgnoreCase) >= 0 ? id : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static bool IsExcludedRole(BotOwner botOwner)
     {
         var role = botOwner?.Profile?.Info?.Settings?.Role;
         if (!role.HasValue) return false;
 
+        // White Tusks always keep ISB's behaviour, independently of the takeover toggle.
+        if (IsbRolePolicy.IsWhiteTusk((int)role.Value))
+        {
+            Log.Info($"FACTION ISB: {botOwner.Profile.Nickname} role={role.Value} ({(int)role.Value}) keeps native White Tusk behaviour");
+            return true;
+        }
+
         // ORBIT registers on these vanilla brains only to drive custom factions that borrow them; never take over
         // the real vanilla bots, so exclude their WildSpawnTypes unconditionally. Custom faction types differ and
         // fall through to the toggle logic below.
         switch (role.Value)
         {
-            case EFT.WildSpawnType.exUsec:
             case EFT.WildSpawnType.bossGluhar:
             case EFT.WildSpawnType.followerGluharScout:
                 return true;
-            // ISB 1.0 "White Tusk" commanders (ISBBossCommander / ISBFollowerCommander). They run on the
-            // ExUsec brain with a permanent always-on Hunt layer — taking them over would break the mod's
-            // core mechanic (per Firefly, the ISB author).
-            case (EFT.WildSpawnType)13707:
-            case (EFT.WildSpawnType)13708:
-                return true;
+        }
+
+        // Faction hunts use their owner's toggle, including UNTAR's legacy generic "hunt" marker.
+        // Unknown owners keep their native behaviour instead of bypassing every exclusion.
+        if (role.Value == EFT.WildSpawnType.pmcBot && HuntSpawnId(botOwner) is { } huntId)
+        {
+            var excluded = HuntFactionPolicy.IsExcluded(huntId, LegacyUntarHunts, _excludedRoleSubstrings);
+            var owner = HuntFactionPolicy.Owner(huntId, LegacyUntarHunts) ?? "unknown";
+            Log.Info($"FACTION HUNT: {botOwner.Profile.Nickname} role={role.Value} spawn={huntId} owner={owner} control={(excluded ? "native" : "ORBIT")}");
+            return excluded;
         }
 
         if (_excludedRoleSubstrings.Count > 0)
@@ -120,7 +148,12 @@ public class OrbitBrainLayer : CustomLayer
             return true;
         }
 
-        if (_vanillaRaiders && role.Value.IsRaider())
+        if (_vanillaRaiders && role.Value == WildSpawnType.pmcBot)
+        {
+            return true;
+        }
+
+        if (_vanillaRogues && role.Value == WildSpawnType.exUsec)
         {
             return true;
         }
@@ -175,34 +208,54 @@ public class OrbitBrainLayer : CustomLayer
 
     private void OnLayerChanged(AICoreLayer<BotLogicDecision> layer)
     {
-        var mover = _agent.Bot.Mover;
+        // BigBrain has already selected the new layer. Release our movement hooks before any
+        // physical operation can throw, otherwise both controllers can keep driving this bot.
+        var wasActive = _agent.IsActive;
+        _agent.IsActive = false;
         var layerName = layer.Name();
-
-        if (layerName == LayerName)
-        {
-            Log.Debug($"{_agent} stopping builtin bot mover");
-            mover.Stop();
-            _agent.IsActive = true;
-        }
-        else
-        {
-            if (_agent.IsActive)
-            {
-                Log.Debug($"{_agent} setting player to navmesh");
-                // Make every mover state variable reflect the current position so SetPlayerToNavMesh doesn't
-                // snap the bot back to a stale target after our layer hands the brain back to BSG.
-                mover._lastGoodCastPoint = mover._prevSuccessLinkedFrom = mover._prevLinkPos = mover.PositionOnWayInner = _agent.Position;
-                mover._lastGoodCastPointTime = Time.time;
-                mover._prevPosLinkedTime = 0f;
-                mover.SetPlayerToNavMesh(_agent.Position);
-                _agent.IsActive = false;
-            }
-        }
-
         var sainCombatNow = layerName == SainCombatLayerName;
         if (_sainCombatActive && !sainCombatNow)
             _sainCombatEndedAt = Time.time;
         _sainCombatActive = sainCombatNow;
+
+        try
+        {
+            var mover = _agent.Bot.Mover;
+            if (layerName == LayerName)
+            {
+                _agent.Stuck.Recovery.CancelHandoff();
+                Log.Debug($"{_agent} stopping builtin bot mover");
+                mover.Stop();
+                _agent.IsActive = true;
+            }
+            else
+            {
+                if (_agent.IsDormant)
+                    Log.Info($"{_agent} dormant body handed to BSG layer {layerName} (priority {layer.Priority})");
+                if (wasActive)
+                {
+                    // Release our path/loot pause now, before the new layer starts its action.
+                    // Deferred loot cleanup must not unpause a mover subsequently owned by SAIN.
+                    mover.Pause = false;
+                    mover.Stop();
+                    if (_agent.Stuck.Recovery.TryPrepareHandoff(_agent.Position, mover))
+                        Log.Debug($"{_agent} movement handoff: local navigation seeded without teleport");
+                    else
+                    {
+                        Log.Debug($"{_agent} movement handoff: no supported local navigation point, stale anchors invalidated; local recovery pending");
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            // Do not abort the remaining layer-change subscribers or the new layer's Start.
+            if (Time.time >= _nextHandoffWarningAt)
+            {
+                _nextHandoffWarningAt = Time.time + 5f;
+                Log.Warning($"{_agent} layer handoff to {layerName} failed, ORBIT movement released: {e}");
+            }
+        }
 
         Log.Debug($"{_agent} layer changed to: {layerName} priority: {layer.Priority}");
     }
@@ -214,6 +267,20 @@ public class OrbitBrainLayer : CustomLayer
     public override bool IsActive()
     {
         if (_excluded) return false;
+        // A sleeper never hands its inactive body to BSG. Healing and combat cannot happen on it, and
+        // when the meds gate below let PatrolAssault take a dormant bot, BSG started a first aid on a
+        // body whose animator was off: Medecine.Using stayed stuck and the bot could not walk a single
+        // step after it woke, only teleport (Customs raid: FantaSipper, 30 rescues in 4 minutes). The
+        // ghost patch-up handles bleeds while asleep; real healing resumes on wake.
+        if (_agent.IsDormant)
+        {
+            if (!_lastIsActive)
+            {
+                Log.Debug($"{_agent} IsActive transition: False → True (dormant)");
+                _lastIsActive = true;
+            }
+            return true;
+        }
         var timeSinceSainCombatEnded = _sainCombatActive ? 0f : Time.time - _sainCombatEndedAt;
         var inCombatWindow = _sainCombatActive || timeSinceSainCombatEnded < 15f;
         var medsWorking = BotOwner.Medecine.Using || BotOwner.Medecine.SurgicalKit.HaveWork || BotOwner.Medecine.FirstAid.Have2Do;

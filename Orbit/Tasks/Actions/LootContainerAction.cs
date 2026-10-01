@@ -83,7 +83,7 @@ public class LootContainerAction(AgentData dataset, WaypointSystem waypointSyste
 
         // Defensive: the dispatcher shouldn't put us in this task without a lootable Waypoint, but if
         // something invalidated it, fail clean.
-        if (location == null || location.Target == null)
+        if (location == null)
         {
             Log.Debug($"{agent} LootContainerAction: location/target null, failing");
             objective.Status = ObjectiveStatus.Failed;
@@ -95,6 +95,22 @@ public class LootContainerAction(AgentData dataset, WaypointSystem waypointSyste
         // world state matches what an awake bot would have produced.
         if (!_states.TryGetValue(agent.Id, out var state))
         {
+            // The scheduler may retain this action between strategy ticks even after completion.
+            // Only a new loot order may start another session; existing sessions still finish below.
+            if (objective.Status != ObjectiveStatus.Looting) return;
+
+            // A running session must observe its result first: our own successful pickup removes the
+            // world item before this action gets its next tick. Only reject stale targets for NEW sessions.
+            if (waypointSystem.IsUnavailableLooseLoot(location))
+            {
+                LooseLootRecovery.Abandon(agent, waypointSystem);
+                return;
+            }
+            if (location.Target == null)
+            {
+                objective.Status = ObjectiveStatus.Failed;
+                return;
+            }
             Log.Debug($"{agent} LootContainerAction: starting loot on {location} (target={location.Target?.GetType().Name ?? "null"})");
             state = new BotLootState(agent, location);
             _states[agent.Id] = state;
@@ -104,6 +120,9 @@ public class LootContainerAction(AgentData dataset, WaypointSystem waypointSyste
         state.Tick();
 
         if (!state.IsDone) return;
+
+        var squadWasExtracting = agent.Squad?.ExtractRequested == true;
+        var wasSoloExtracting = agent.SoloExtractRequested;
 
         if (state.Success)
         {
@@ -179,6 +198,22 @@ public class LootContainerAction(AgentData dataset, WaypointSystem waypointSyste
                 agent.Squad.Objective.Duration = 0;
                 Log.Debug($"{agent.Squad} wait timer forced to expire after FAILED loot — immediate re-pick");
             }
+        }
+
+        // Keep the departure decision, but finish a bounded collection of nearby valuables first.
+        // Only the pickup which newly armed a loot departure can open this window.
+        var exitSweepContinues = agent.LootExtractSweep != null
+            ? agent.LootExtractSweep.Next(waypointSystem)
+            : state.Success && state.ItemsTaken
+                && ((!squadWasExtracting && agent.Squad?.ExtractRequested == true
+                        && LootExtractSweep.Begin(agent, waypointSystem, squadDeparture: true))
+                    || (!wasSoloExtracting && agent.SoloExtractRequested && !agent.SoloExtractIsEmergency
+                        && LootExtractSweep.Begin(agent, waypointSystem, squadDeparture: false)));
+        if (exitSweepContinues)
+        {
+            waypointSystem.ReleaseClaim(location.Id, agent.Id);
+            _states.Remove(agent.Id);
+            return;
         }
 
         // Scavenge sweep: if a LooseLoot/Corpse is sitting within ~10m of where the bot just finished, chain
@@ -587,12 +622,11 @@ public class LootContainerAction(AgentData dataset, WaypointSystem waypointSyste
 
     private bool TryScavengeSweep(Agent agent, Waypoint justLooted)
     {
-        // ExtractRequested override: once the squad has decided to leave (loot-value or time threshold hit,
-        // or all mains done), chaining to a nearby loot is wrong — the bot should immediately route to exfil
-        // via the next AssignNewObjective.
-        if (agent.Squad != null && agent.Squad.ExtractRequested)
+        // Ordinary sweeps stop once departure is requested. The bounded valuable collection above is
+        // the only exception, so extraction cannot turn into an unlimited chain of nearby loot.
+        if (agent.SoloExtractRequested || agent.Squad?.ExtractRequested == true)
         {
-            Log.Debug($"{agent} scavenge sweep: skipping — squad has ExtractRequested set");
+            Log.Debug($"{agent} scavenge sweep: skipping, departure requested");
             return false;
         }
 
@@ -720,6 +754,7 @@ internal class BotLootState
             handler.Init(agent.Bot);
         }
         _brain = handler;
+        agent.LootHandler = handler;
     }
 
     public void Begin()
@@ -809,9 +844,24 @@ internal class BotLootState
         if (IsDone) return;
         if (!_started) return;
 
+        // Pickup can destroy or pool the target. Reconcile a completed transfer before inspecting that
+        // target, the watchdog or combat flags, so a successful pickup is not turned into a failure.
+        var lootedNow = _brain.Stats != null ? _brain.Stats.TotalGained : 0f;
+        var targetMissing = _location.Target == null
+                            || (_location.Target is LootItem item && item.Item == null);
+        if (!_brain.LootTaskRunning)
+        {
+            ItemsTaken = lootedNow > _lootedAtStart;
+            Success = ItemsTaken || (!_brain.LastSessionCancelled && !targetMissing);
+            Log.Debug($"{_agent} BotLootState.Tick: brain.LootTaskRunning=false -> done, lootedDelta={(lootedNow - _lootedAtStart):N0}₽, ItemsTaken={ItemsTaken}, cancelled={_brain.LastSessionCancelled}, success={Success}");
+            IsDone = true;
+            CleanupBrainTarget();
+            return;
+        }
+
         // Target destroyed mid-loot — e.g. another player picked up the loose item, a corpse despawned, a
         // container was disabled by a scripted event. Bail cleanly so we don't kneel forever at a ghost.
-        if (_location.Target == null)
+        if (targetMissing && lootedNow <= _lootedAtStart)
         {
             Log.Info($"{_agent} BotLootState: target destroyed mid-loot — cancelling");
             Cancel();
@@ -842,20 +892,6 @@ internal class BotLootState
             return;
         }
 
-        // loot handler clears LootTaskRunning when the async loot finishes (success OR timeout/cancellation).
-        // Compare Stats.TotalGained before and after to determine whether anything was actually taken.
-        if (!_brain.LootTaskRunning)
-        {
-            var lootedNow = _brain.Stats != null ? _brain.Stats.TotalGained : 0f;
-            ItemsTaken = lootedNow > _lootedAtStart;
-            // A cancelled session with nothing taken is a FAILURE (hang watchdog, external stop): the
-            // success path would value-skip instead of squad-blacklisting, and the same broken POI got
-            // re-picked forever. A cancel that still grabbed items counts as success.
-            Success = ItemsTaken || !_brain.LastSessionCancelled;
-            Log.Debug($"{_agent} BotLootState.Tick: brain.LootTaskRunning=false → done, lootedDelta={(lootedNow - _lootedAtStart):N0}₽, ItemsTaken={ItemsTaken}, cancelled={_brain.LastSessionCancelled}, success={Success}");
-            IsDone = true;
-            CleanupBrainTarget();
-        }
     }
 
     public void Cancel()

@@ -1,5 +1,7 @@
 using System.Reflection;
 using EFT;
+using Comfort.Common;
+using Orbit.Core;
 using Orbit.Systems;
 using SPT.Reflection.Patching;
 
@@ -22,10 +24,12 @@ public class DormantVisionPatch : ModulePatch
     public static bool Prefix(EnemyInfo __instance)
     {
         var person = __instance?.Person;
-        if (person == null || !DormancySystem.IsDormantProfile(person.ProfileId))
+        if (person == null || !DormancySystem.IsDormantProfile(person.ProfileId)
+            && Singleton<OrbitManager>.Instance?.DormancySystem.DeferSpawnContact(__instance, firstSight: true, source: "vision") != true)
             return true;
 
         __instance.SetVisible(false);
+        __instance.SetCanShoot(false);
         DormancySystem.VisionBlocks++;
         return false;
     }

@@ -85,18 +85,25 @@ public class Squad(int id, float[] taskScores, int targetMembersCount) : Entity(
     /// One-way flag — stays true for the rest of the raid.
     /// </summary>
     public bool ExtractRequested;
+    internal Orbit.Tasks.LootExtractSweep LootExtractSweep;
 
     /// <summary>
-    /// AI-limiter temporal hysteresis (DormancySystem): Time.time of the squad's last wake and last
-    /// sleep entry. Fields on the squad rather than a DormancySystem dictionary on purpose — squad ids
-    /// are recycled, so id-based equality would bleed one squad's cooldowns into its successor.
+    /// Earliest next sleep after a wake, and last sleep entry. Stored on the squad because ids
+    /// are recycled; a replacement squad must not inherit its predecessor's cooldown.
     /// </summary>
-    public float DormancyWokeAt = -999f;
+    public float DormancySleepAllowedAt = -999f;
     public float DormancySleptAt = -999f;
 
     /// <summary>Time.time until which this squad is pinned in a simulated ghost fight — ghost movement
     /// holds position for the window (you don't walk your route mid-firefight).</summary>
     public float GhostFightUntil = -999f;
+
+    /// <summary>Ghost hearing: where the sleeping squad decided to go and look after hearing a firefight.
+    /// Set by DormancySystem, consumed (and cleared) by GotoObjectiveStrategy on its next tick.</summary>
+    public Vector3? InvestigateNoisePosition;
+
+    /// <summary>Time.time of the last noise this squad reacted to, paces the next reaction.</summary>
+    public float LastNoiseReactionAt = -999f;
 
     /// <summary>
     /// Short human-readable string describing WHY this squad flipped
@@ -119,6 +126,9 @@ public class Squad(int id, float[] taskScores, int targetMembersCount) : Entity(
     /// objectives.
     /// </summary>
     public int ConsecutiveDispatchFailures;
+    public float NextDispatchAttemptAt;
+    public bool FailedDispatchWasExtract;
+    public Vector3 FailedDispatchPosition;
 
     /// <summary>
     /// How many consecutive times every squad member arrived at the "all members failed their objective
@@ -251,21 +261,6 @@ public class Squad(int id, float[] taskScores, int targetMembersCount) : Entity(
     /// supporter every tick for the whole fight.
     /// </summary>
     public Waypoint CombatCallerWaypoint;
-
-    /// <summary>
-    /// Agent.Id of the squad member who landed the most recent killing blow whose corpse is still "fresh"
-    /// (not yet looted / claimed by anyone). When the strategy's own-kill priority pick has promoted the
-    /// corpse to <see cref="SquadObjective.Location"/>, UpdateAgents routes THIS specific agent directly to
-    /// the corpse instead of rolling a random roam splinter for them. -1 = no pending kill credit.
-    /// </summary>
-    public int PendingOwnKillKillerAgentId = -1;
-
-    /// <summary>
-    /// Waypoint.Id of the corpse the <see cref="PendingOwnKillKillerAgentId"/> flag is currently armed for.
-    /// Compared against the squad's current objective so a stale credit (squad anchor has since moved to a
-    /// different POI) silently no-ops instead of mis-routing the killer. 0 = no pending kill credit.
-    /// </summary>
-    public int PendingOwnKillCorpseLocId;
 
     /// <summary>
     /// ProfileId of a squad member who just died WITH meaningful loot — the surviving members should

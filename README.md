@@ -17,7 +17,7 @@
 
 ---
 
-Every bot squad in your raid spawns with a plan: a rich area to strip, a
+Every bot squad in your raid follows a plan: a rich area to strip, a
 PvP hotspot to hunt, a quest spot to visit. They work it as a team, loot
 like players, upgrade their gear along the way, and head for extract when
 they're done. Kill one late in the raid and his backpack tells the story
@@ -25,14 +25,15 @@ of where he's been.
 
 Built on [Phobos](https://discord.com/channels/875684761291599922/1337131427803955200)'s foundations (MIT, with Janky's blessing - full credits below).
 
-**2.0's headliner is 👻 Ghost Mode**: far-away bots go dormant to free
+**👻 Ghost Mode**: far-away bots go dormant to free
 your CPU while ORBIT keeps playing them. The fps gains are massive
 (+45% average in my heavy-population benchmark, testers report +50 to
-+100%) and the world stays alive instead of freezing. 2.0 also adds
-a server **web UI** for every setting and a visual **zone editor** to
-draw your own hotspots on the map.
++100%) and the world stays alive instead of freezing. **Ghost Mode supports
+ORBIT-controlled bots as well as vanilla and faction bots.** A server **web UI**
+and visual **zone editor** let you target zones by floor and bot type,
+or share your setup through presets.
 
-[📷 Screenshot](https://i.imgur.com/WSWqb8d.png) · Pair with [Raid Review]([https://forge.sp-tarkov.com/mod/1479/raid-review](https://sp-mod.com/mod/1479/raid-review)) to replay it all · Questions & feedback: [ORBIT Discord thread](https://discord.com/channels/875684761291599922/1509314495019745451)
+[📷 Screenshot](https://i.imgur.com/WSWqb8d.png) · Pair with [Raid Review](https://forge.sp-tarkov.com/mod/1479/raid-review) to replay it all · Questions & feedback: [ORBIT Discord thread](https://discord.com/channels/875684761291599922/1509314495019745451)
 
 ## What a raid looks like
 
@@ -46,55 +47,55 @@ draw your own hotspots on the map.
 
 ## The pillars
 
-### 👻 Ghost Mode (2.0) - the fps game changer
+### 👻 Ghost Mode - the fps game changer
 
-The biggest fps upgrade a bot-heavy raid can get. My heavy-population
-Shoreline benchmark measured **+45% average fps** with far fewer
-stutters; RC testers reported anywhere from **+50 to +100%** depending
-on map, modlist and hardware, and "buttery smooth" frametimes across
-the board. Ships **ON by default** - one switch in the web UI turns it
-off.
+My heavy-population Shoreline benchmark measured **+45% average fps** with
+far fewer stutters; RC testers reported anywhere from **+50 to +100%** depending
+on map, modlist and hardware. Ships **ON by default** - one switch in
+the web UI turns it off.
 
 Classic limiters freeze distant bots and kill the living world with
 them. Ghost Mode puts only the **body** to sleep - the expensive
-EFT machinery - while ORBIT keeps thinking. Ghost squads keep
-walking their routes and keep looting in real time. When two hostile
-ghosts spot each other (optic-scaled range, terrain and forests block
+EFT machinery - while their behaviour continues. ORBIT-controlled ghosts
+keep walking their routes and looting in real time; native bots follow
+their original behaviour. When two hostile ghosts spot each other
+(optic-scaled range, terrain and forests block
 line of sight), the fight plays out over a real window with audible
 distant gunfire matching each side's real weapons (suppressors
 included), real casualties and wounded survivors. Get close while
 it's still going and it escalates into an actual firefight.
 
-Waking is seamless: proximity, damage, or aiming through a scope (the
-wake range stretches with your magnification). Everything is tunable,
-down to which bot types sleep by default and how bloody ghost fights
-get.
+Bots wake on proximity, damage, or aiming through a scope (the wake
+range stretches with your magnification). Tune which bot types sleep,
+whether they move and loot, and how bloody ghost fights get.
 
-*Coming in 2.1: ghost movement for the bots ORBIT doesn't drive
-(vanilla scavs, raiders and rogues, bosses and followers, UNTAR / RUAF
-and other faction mods) - today those sleep frozen in place. Until
-that ships, for faction-mod bots I recommend either enabling their
-"Take over" toggle (Factions page, they become ORBIT-driven and ghost
-properly) or disabling Ghost Mode for their bot type (the "Dormant"
-toggles on the Ghost Mode page), so you never run into frozen bots.
-Awake bots wake any ghost they come across, so those encounters play
-out as real fights instead of simulated ones.*
+**Vanilla and faction bots can use Ghost Mode without ORBIT takeover.**
+Enable their **Dormant** toggle, **Ghost movement** and **Vanilla / faction movement**.
+Leave faction **Take over** toggles OFF, or keep **Vanilla xxx** checked,
+to preserve their original behaviour. These bots keep their own routing
+and are not influenced by ORBIT zones. ISB White Tusks always keep their
+native behaviour, even with takeover enabled.
 
-*Fika: designed for co-op (an optional `Orbit.Fika` addon syncs the
-fight sounds to every client) but untested so far.*
+Set gunfire investigation chances by personality for ORBIT-controlled PMC
+and PlayerScav squads on the Ghost Mode page. For encounters with awake bots, choose
+whether to put eligible awake bots to sleep or wake the ghosts; combat and
+player proximity protections still apply.
+
+*Fika: the optional `Orbit.Fika` addon syncs ghost fight sounds and ORBIT door states. Install the same version of it
+on the host (or headless) and all playing clients.*
 
 ### 🎯 Objectives and extraction
 
-Squads roll 1-5 goals at spawn: high-value loot zones, kill hunts
-anchored on PvP hotspots, real EFT quest triggers. The leader takes the
-anchor, the others splinter to nearby loot and cover. They extract for
+ORBIT-controlled PMC and PlayerScav squads receive goals: high-value loot
+zones, kill hunts anchored on PvP hotspots, visits to EFT quest locations.
+The leader takes the anchor, the others splinter to nearby loot and cover. They extract for
 real reasons - enough roubles, goals completed, or the raid clock - and
 they coordinate on shared exfils like the car.
 
 ### 🎒 Looting that feels human
 
-A custom loot engine built on BSG's own pickup APIs. Per-personality
-value thresholds (a GigaChad ignores what a Rat treasures), realistic
+ORBIT-controlled bots use a custom loot engine built on BSG's pickup APIs.
+Per-personality value thresholds (a GigaChad ignores what a Rat treasures), realistic
 search timings and animations, inside-out container draining, and
 mid-raid **gear upgrades**: a bot that finds a better rifle swaps to it,
 strips the good mods off his old one, and leaves it on the corpse for
@@ -105,16 +106,17 @@ you to find.
 
 - Value is judged per inventory slot (price ÷ size): a 50k key beats a
   bulky 60k backpack.
-- Scavs pick things up opportunistically (dice per item) instead of
+- Regular scavs pick things up opportunistically (dice per item) instead of
   using thresholds. PlayerScavs loot like PMCs.
-- Money, grenades and dogtags are always taken.
+- Money, fragmentation grenades and dogtags bypass value and scav chance checks,
+  provided the bot has room to carry them.
 - Squad memory: a Chad's "nothing good here" verdict doesn't stop the
   squad's Rat from cleaning the same container later.
 - Weapon swaps are scored on ergo/recoil/range/ammo (with per-map
   weights), never on price alone, and only count ammo the bot can
   actually use.
 - Rig/backpack swaps transfer the whole carry first; if one item won't
-  fit, the swap is cancelled. Scavs never swap, they only fill empty
+  fit, the swap is cancelled. Regular scavs never swap, they only fill empty
   slots.
 - PMC corpses keep their melee; secured containers are never touched.
 - Coverage rolls make squads miss a few items per room, like real
@@ -123,23 +125,47 @@ you to find.
 
 ### 🧠 Personalities run the show
 
-Everything above bends to each bot's SAIN personality: what's worth
+ORBIT uses SAIN personalities to shape PMC behaviour: what's worth
 picking up, how much of a room gets covered, who hunts and who rats, how
 early they extract, whether they force locked doors, even how strong a
 ghost squad fights off-screen. Two squads never play the same raid.
 
-### 🗺️ Your raid, your rules (2.0)
+### 🗺️ Your raid, your rules
 
-Every behaviour setting lives in a **web UI** on your SPT server
-(`/orbit`, one button away from the F12 menu). It applies at the next
-raid and works headless. Full-config export/import included, to back
-up or share your tuning.
+ORBIT's behaviour settings live in a **web UI** on your SPT server
+(`/orbit`, one button away from the F12 menu), including headless setups.
+Most settings apply next raid; faction takeover changes require a game
+restart. Full-config export/import lets you back up or share your tuning.
+
+**Presets:** save, switch and share settings and zones together.
+Custom tuning from 2.0 is preserved as **Custom**. Editing **Default** or an
+addon creates a personal copy.
+
+<details>
+<summary>Sharing addon presets</summary>
+
+Put your exported JSON files in one folder under the server's
+`user/mods/ORBIT/addon/`, for example `addon/MyPreset/config.json` and
+`addon/MyPreset/zones.orbitzones.json`. Each addon folder becomes one
+selectable preset; a partial preset keeps settings and maps it does not supply.
+
+Keep that folder structure in your ZIP, and keep the **same folder and
+filenames** for updates so they overwrite the previous files. Put version
+numbers in the ZIP name. Updates refresh the selected addon automatically;
+personal copies keep their own edits.
+
+</details>
 
 The **zone editor** renders each map and lets you draw the hotspots
 that steer squad routing: drag, resize, attract or repel, tune BSG's
 own zones, mark which ones can host kill hunts. Export your setup as a
 **zone pack** and publish it on the Forge as an ORBIT addon, or import
 someone else's.
+
+Name your custom zones and target specific bot types, factions
+and floors. Reserve includes floors 2 through 5; Customs includes its fourth
+floor. Zones influence ORBIT-controlled bots, awake or Ghost, and still need
+a reachable route to the selected area.
 
 ## Install
 
@@ -170,17 +196,17 @@ Save (editing a built-in preset creates an editable copy).
 
 ## Compatibility
 
-**Required**: [SAIN](https://forge.sp-tarkov.com/mod/791/sain-solarints-ai-modifications-full-ai-combat-system-replacement) - ORBIT plugs into its personality system.
+**Required**: BigBrain, Waypoints and SAIN (linked under Install above).
+ORBIT uses SAIN's personality system.
 
 **Recommended**: spawn and loadout mods shape *who* spawns with *what
-gear*; ORBIT decides *where they go and what they do*. The layers don't
-fight. [APBS](https://forge.sp-tarkov.com/mod/963/algorithmic-progression-bot-system), [ABPS](https://forge.sp-tarkov.com/mod/2103/another-better-progression-system), [Raid Review](https://forge.sp-tarkov.com/mod/1479/raid-review).
+gear*; ORBIT decides *where its squads go and what they do*.
+[APBS](https://sp-mod.com/mod/1594/apbs-acids-progressive-bot-system), [ABPS](https://sp-mod.com/mod/2097/abps-acids-bot-placement-system), [Raid Review](https://forge.sp-tarkov.com/mod/1479/raid-review).
 
-**Do not combine with**: any other mod that moves, quests, loots or
-culls bots. That includes [QuestingBots](https://forge.sp-tarkov.com/mod/1109/questing-bots), [LootingBots](https://forge.sp-tarkov.com/mod/812/looting-bots), Phobos itself, and AI limiter / culling
-mods (AILimit, Adaptive Bot Culling...) - ORBIT ships its own limiter.
-If a mod replaces bot brains or dispatches bots somewhere, assume it
-conflicts.
+**Do not combine with**: [QuestingBots](https://forge.sp-tarkov.com/mod/1109/questing-bots), [LootingBots](https://forge.sp-tarkov.com/mod/812/looting-bots), Phobos itself, or other AI limiter / culling
+mods (AILimit, Adaptive Bot Culling...). Their systems overlap with ORBIT's
+objectives, looting or Ghost Mode. Supported faction mods have their own
+**Take over** toggles; leave them OFF to retain the author's behaviour.
 
 ## Troubleshooting
 
@@ -195,38 +221,26 @@ first). Then come say hi on the [ORBIT thread](https://discord.com/channels/8756
 
 ## Roadmap highlights
 
-**Next (2.1)**: Ghost Mode moves the bots ORBIT doesn't drive (vanilla
-scavs, raiders, rogues, bosses and followers, UNTAR / RUAF and other
-faction mods), so nothing on the map sleeps frozen anymore. Also for
-the zone editor: zones filtered by faction or bot type, per-floor
-zones (Reserve bunkers, Techlight...), and names on custom zones.
-Per-map Ghost Mode settings are on the maybe list.
-
 No ETA, no promises: camp & ambush decisions, post-combat self-heal,
 squad splitting with radio comms, boss hunting and faction rivalries
 (Firefly's idea), airdrop ambushes, a "rally flare" item that pulls the
 whole map onto a point, multi-step objectives (Kiba alarm, ULTRA power,
 Reserve D-2...), switch-gated and Red-Rebel-style exfils, cross-raid
 player heatmaps feeding bot routing (Fiodor's idea), per-map ORBIT
-toggle. Suggestions land on the Discord thread.
+and Ghost Mode settings. Suggestions land on the Discord thread.
 
 ## Known issues
 
-- Ghost Mode and the zone editor are brand new in 2.0: expect tuning
-  passes. Fika support for the limiter is designed in but untested.
-- Bots ORBIT doesn't drive (vanilla scavs, raiders/rogues, bosses and
-  followers, faction mods) sleep FROZEN in place under Ghost Mode
-  (ghost movement for them comes in 2.1). Workarounds for faction
-  bots: enable their "Take over" toggle, or turn OFF the Dormant
-  toggle for their bot type.
-- Most Reserve exfils need switches ORBIT can't operate yet.
+- Some native or modded actions require bots to stay awake. Bosses that
+  normally hold position may also remain still in Ghost.
+- ORBIT can't operate extraction switches yet (for example, Reserve's D-2).
 - Faction-mod takeover (RUAF / UNTAR / Black Division) can misbehave;
-  leave those toggles OFF if it does. ISB takeover works.
+  leave those toggles OFF if it does. Ghost Mode can still be used.
 - Labs security gates can trap bots (BSG pathing quirk, checkpoint
   tuning planned).
 - Possible clash with CactusPie's auto-transfer-loot mod (bot pickups
   may land in YOUR tagged containers). Investigating.
-- Rare stuck bots; they usually free themselves within a minute.
+- Bots can still occasionally get stuck on map geometry.
 
 ## About AI
 

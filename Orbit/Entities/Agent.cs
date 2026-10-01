@@ -1,6 +1,8 @@
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using EFT;
+using EFT.InventoryLogic;
+using Orbit.Navigation;
 using UnityEngine;
 
 namespace Orbit.Entities;
@@ -26,6 +28,21 @@ public class Agent(int id, BotOwner bot, float[] taskScores) : Entity(id, taskSc
     /// branch on this flag.
     /// </summary>
     public bool IsDormant;
+    internal Orbit.Looting.OrbitLootHandler LootHandler;
+
+    /// <summary>Ghost gear swaps. A sleeper changes its equipment through inventory transactions only: the
+    /// hands controller cannot run on an inactive body, so the weapon in hands is never touched while asleep.
+    /// <see cref="GhostHandsResync"/> asks the wake resync to refresh the weapon selector and redraw the main
+    /// weapon. <see cref="GhostPendingPromotion"/> is a better weapon parked in the second primary slot,
+    /// waiting for the slot1/slot2 swap, which moves the weapon in hands and is done at the next AWAKE loot
+    /// session. <see cref="GhostBestWeapon"/> is what the sleeper fights with in simulated fights meanwhile.</summary>
+    public bool GhostHandsResync;
+
+    /// <summary>Time.time at which the limiter first found an inventory operation in flight on this body
+    /// while it wanted to put it to sleep, -1 when none. Bounds how long that gate may hold the body awake.</summary>
+    public float InventoryBusySince = -1f;
+    public Weapon GhostPendingPromotion;
+    public Weapon GhostBestWeapon;
 
     /// <summary>Total HP captured at sleep entry. The dormancy poll wakes the squad the moment current HP
     /// drops below this (mines and other position-based damage still land on inactive bodies, and a
@@ -38,6 +55,10 @@ public class Agent(int id, BotOwner bot, float[] taskScores) : Entity(id, taskSc
     public float LastPollHp;
     public float LastHpDropTime = -999f;
 
+    /// <summary>Time.time of the last simulated patch-up (DormancySystem): a far, out-of-combat bot whose HP
+    /// keeps dropping gets its negative effects stripped so the bleed gate can clear and it can sleep.</summary>
+    public float LastGhostPatchUpAt = -999f;
+
     public readonly BotOwner Bot = bot;
     public readonly Player Player = bot.Mover._player;
 
@@ -48,31 +69,14 @@ public class Agent(int id, BotOwner bot, float[] taskScores) : Entity(id, taskSc
     public readonly Objective Objective = new();
     public readonly Guard Guard = new();
 
-    /// <summary>
-    /// Id of the POI on which this agent's most recent Goto attempt failed via the "stopped outside arrival
-    /// radius" branch, or -1 if the most recent dispatch ended cleanly. Used by GotoObjectiveAction to detect
-    /// repeated arrival failures on the SAME POI by this agent. Distinct from the squad-level
-    /// <c>ConsecutiveFailedDispatches</c>: that counter targets the SQUAD anchor when it blacklists, so when
-    /// the bot is failing on a SPLINTER whose parent is the squad anchor, the squad blacklists the parent —
-    /// the splinter itself stays a valid candidate for the next pick and the loop continues. The per-agent
-    /// counter blacklists the specific POI the bot is physically failing to reach.
-    /// </summary>
-    public int LastFailedPoiId = -1;
+    public readonly ArrivalFailureHistory ArrivalFailures = new();
+    internal readonly Systems.QuestArrival QuestArrival = new();
 
     /// <summary>
-    /// Waypoint.Id of a corpse this agent killed but was pulled away from before looting (SAIN combat, healing,
-    /// solo-extract). 0 = none. While set, dispatch re-routes the agent back onto its own kill as a personal
-    /// splinter, gated on the corpse still being unlooted, reachable and nearby.
+    /// Corpses credited to this agent, kept across combat and normal extraction detours.
+    /// Dispatch removes definitive skips/completions and retries temporary claims or path failures.
     /// </summary>
-    public int OwnKillCorpseLocId;
-
-    /// <summary>
-    /// Counter incremented every time Goto fails on
-    /// <see cref="LastFailedPoiId"/>. Reset to 1 when the agent fails on a
-    /// DIFFERENT POI. Past the blacklist threshold the POI is added to the squad's <c>CompletedPoiIds</c> so
-    /// future picks skip it.
-    /// </summary>
-    public int ConsecutiveSamePoiFailures;
+    public readonly List<int> OwnKillCorpseIds = new(4);
 
     /// <summary>
     /// POI id this agent is currently failing arrival on because Physics.Raycast LoS is blocked (within the
@@ -135,6 +139,7 @@ public class Agent(int id, BotOwner bot, float[] taskScores) : Entity(id, taskSc
     public string SoloExtractReason;
     public Orbit.Navigation.Waypoint SoloExtractTarget;
     public bool SoloLootThresholdRolled;
+    internal Orbit.Tasks.LootExtractSweep LootExtractSweep;
 
     /// <summary>
     /// HP-trend emergency-extract state. An HP-triggered solo extract can be cancelled if HP recovers (unlike a

@@ -10,6 +10,7 @@ using Orbit.Helpers;
 using Orbit.Looting;
 using Orbit.Navigation;
 using Orbit.Sain;
+using Orbit.Zones;
 using UnityEngine;
 using UnityEngine.AI;
 using Random = UnityEngine.Random;
@@ -35,7 +36,7 @@ public struct Cell()
 /// corpse), and the per-squad reachability + claim + cooldown state that <c>RequestNear</c> consults to
 /// assign objectives. Heavy file — most of the routing intelligence lives here.
 /// </summary>
-public class WaypointSystem
+public partial class WaypointSystem
 {
     private readonly Cell[,] _cells;
     private readonly float _cellSize;
@@ -51,6 +52,7 @@ public class WaypointSystem
     private readonly List<Zone> _zones;
     private readonly Vector2[,] _advectionField;
     private readonly string _mapId;
+    private readonly string _zoneKey;
 
     // Player convergence: a per-cell pull toward the living human player(s), refreshed every 30s as
     // they move. Folded into RequestNear's preferred-direction sum alongside advection / home / main.
@@ -108,13 +110,16 @@ public class WaypointSystem
     public Vector2[,] ConvergenceField => _convergenceField;
     public List<Zone> Zones => _zones;
 
-    public WaypointSystem(string mapId, WaypointConfig waypointConfig, BotsController botsController, List<Player> humanPlayers)
+    public WaypointSystem(string mapId, string zoneKey, WaypointConfig waypointConfig, BotsController botsController, List<Player> humanPlayers)
     {
         _mapId = mapId;
-        _zoneConfig = waypointConfig.MapZones[mapId];
+        _zoneKey = zoneKey;
+        _zoneConfig = waypointConfig.ResolveZones(zoneKey, mapId);
         // Zone editor (server web UI): the server's per-map zones override the local JSON for the
-        // whole session; without a reachable server mod the local files stay authoritative.
-        if (ServerConfig.TryGetZoneOverride(mapId, out var serverZones))
+        // whole session; without a reachable server mod the local files stay authoritative. A map
+        // variant reads its own key first, then the base map's (older server mods only know the base).
+        if (ServerConfig.TryGetZoneOverride(zoneKey, out var serverZones)
+            || (zoneKey != mapId && ServerConfig.TryGetZoneOverride(mapId, out serverZones)))
             _zoneConfig.ApplyOverride(serverZones);
         _botsController = botsController;
         _humanPlayers = humanPlayers;
@@ -123,7 +128,7 @@ public class WaypointSystem
         // radii from it.
         // map= is parsed by dashboard/parse_log.py for the per-raid index — keep the format in sync.
         Log.Info($"Calculating world geometry (map={mapId})");
-        var geometryConfig = waypointConfig.MapGeometries.Value[mapId];
+        var geometryConfig = waypointConfig.ResolveGeometry(zoneKey, mapId);
         _cellSize = geometryConfig.CellSize;
         _cellSubSize = _cellSize / 2f;
 
@@ -217,7 +222,7 @@ public class WaypointSystem
 
         // Convergence — null in the zone JSON (file predates the restore) falls back to the compiled-in
         // per-map default; radius/force are sampled once per raid from their ranges.
-        _convergence = _zoneConfig.Value.Convergence ?? WaypointConfig.DefaultConvergenceFor(mapId);
+        _convergence = _zoneConfig.Value.Convergence ?? WaypointConfig.DefaultConvergenceFor(zoneKey, mapId);
         _convergenceRadius = _convergence.Radius.SampleUniform();
         _convergenceForce = _convergence.Force.SampleUniform();
         _convergenceField = new Vector2[_gridSize.x, _gridSize.y];
@@ -232,7 +237,7 @@ public class WaypointSystem
     public void ReloadConfig()
     {
         _zoneConfig.Reload();
-        _convergence = _zoneConfig.Value.Convergence ?? WaypointConfig.DefaultConvergenceFor(_mapId);
+        _convergence = _zoneConfig.Value.Convergence ?? WaypointConfig.DefaultConvergenceFor(_zoneKey, _mapId);
         _convergenceRadius = _convergence.Radius.SampleUniform();
         _convergenceForce = _convergence.Force.SampleUniform();
         CalculateConvergence();
@@ -317,6 +322,7 @@ public class WaypointSystem
     public void CalculateAdvectionZones()
     {
         _zones.Clear();
+        var nativeFloors = CollectNativeZoneFloors();
 
         for (var i = 0; i < _botsController.BotSpawner._allBotZones.Length; i++)
         {
@@ -334,7 +340,8 @@ public class WaypointSystem
                 WorldToCellCentered(new Vector2(botZone.CenterOfSpawnPoints.x, botZone.CenterOfSpawnPoints.z)),
                 builtinZone.Radius.SampleGaussian(),
                 builtinZone.Force.SampleGaussian(),
-                builtinZone.Decay
+                builtinZone.Decay, new ZoneScope { BotTypes = builtinZone.BotTypes, FloorId = nativeFloors[botZone.name] }, botZone.CenterOfSpawnPoints,
+                builtinZone.KillMains && builtinZone.Force.Max > 0f
             );
             _zones.Add(zone);
         }
@@ -360,7 +367,8 @@ public class WaypointSystem
                 WorldToCellCentered(customZone.Position),
                 customZone.Radius.SampleGaussian(),
                 customZone.Force.SampleGaussian(),
-                customZone.Decay
+                customZone.Decay, customZone, new Vector3(customZone.Position.x, 0f, customZone.Position.y),
+                customZone.KillMains && customZone.Force.Max > 0f
             );
             _zones.Add(zone);
         }
@@ -376,6 +384,7 @@ public class WaypointSystem
                 for (var i = 0; i < _zones.Count; i++)
                 {
                     var zone = _zones[i];
+                    if (zone.IsScoped) continue;
                     var zoneCoords = zone.Coords;
                     var worldDist = Vector2.Distance(zoneCoords, cellCoords) * _cellSize;
                     var force = Mathf.Clamp01(1f - worldDist / (zone.Radius * ServerConfig.Zones.ZoneRadiusScale));
@@ -388,11 +397,38 @@ public class WaypointSystem
 
         foreach (var coords in _assignments.Values)
             PropagateForce(coords, 1f);
+        LogZoneScopes();
     }
 
     // Threshold for the islanded-pin: after this many consecutive null returns from RequestNear/RequestFar,
     // the squad is treated as stranded and locked to local cell only.
     private const int IslandedFailureThreshold = 3;
+
+    /// <summary>
+    /// Ghost hearing: a waypoint in the cell of a noise (or the closest neighbouring cell that yields one),
+    /// so a squad can be sent to look at a place rather than at a POI. Same bookkeeping as RequestNear: the
+    /// current assignment is returned first, the pick goes through AssignWaypoint (claims, blacklist,
+    /// reachability, faction filters).
+    /// </summary>
+    public Waypoint RequestForInvestigation(Entity entity, Vector3 worldPos)
+    {
+        var center = WorldToCell(worldPos);
+        if (!IsValidCell(center)) return null;
+        Return(entity);
+        for (var ring = 0; ring <= 1; ring++)
+        {
+            for (var dx = -ring; dx <= ring; dx++)
+            for (var dy = -ring; dy <= ring; dy++)
+            {
+                if (ring == 1 && dx == 0 && dy == 0) continue;
+                var coords = center + new Vector2Int(dx, dy);
+                if (!IsValidCell(coords) || !_cells[coords.x, coords.y].HasWaypoints) continue;
+                var pick = AssignWaypoint(entity, coords);
+                if (pick != null) return pick;
+            }
+        }
+        return null;
+    }
 
     public Waypoint RequestNear(Entity entity, Vector3 worldPos, Waypoint previous)
     {
@@ -468,7 +504,8 @@ public class WaypointSystem
             }
         }
 
-        var advectionVector = _advectionField[requestCoords.x, requestCoords.y];
+        var advectionVector = _advectionField[requestCoords.x, requestCoords.y]
+            + ScopedAttraction(entity as Squad, requestCoords);
         var convergenceVector = _convergenceField[requestCoords.x, requestCoords.y];
         var randomization = Random.insideUnitCircle;
         randomization *= 0.5f;
@@ -785,6 +822,10 @@ public class WaypointSystem
             if (kvp.Value != squad.Id) continue;
             var locId = kvp.Key;
             if (squad.CompletedPoiIds.Contains(locId)) continue;
+            var anyEligibleMember = false;
+            for (var member = 0; member < squad.Members.Count; member++)
+                if (!squad.Members[member].ValueSkippedPoiIds.Contains(locId)) { anyEligibleMember = true; break; }
+            if (!anyEligibleMember) continue;
             if (_claims.ContainsKey(locId)) continue;
             if (!_waypointCells.TryGetValue(locId, out var coords)) continue;
             // Stale-kill gate: if the corpse is too far from the leader, skip the bee-line and let normal
@@ -821,7 +862,7 @@ public class WaypointSystem
     /// <summary>
     /// Own-kill re-route resolver for ONE corpse, gated on the killer agent's own position rather than the
     /// squad leader's, so a follower pulled off its kill is routed back without dragging the whole squad.
-    /// Returns null if it no longer qualifies (the caller drops its OwnKillCorpseLocId memory on null).
+    /// Temporary claims and path failures do not consume the pending kill credit.
     /// </summary>
     internal Waypoint TryGetOwnKillCorpseForAgent(Squad squad, Agent agent, int locId)
     {
@@ -851,6 +892,27 @@ public class WaypointSystem
         if (corpse == null || corpse.Category != WaypointCategory.Corpse) return null;
         if (!IsWaypointReachable(corpse, squad)) return null;
         return corpse;
+    }
+
+    internal Waypoint TryGetNextOwnKillCorpseForAgent(Squad squad, Agent agent)
+    {
+        // FIFO preserves a route already being worked when another Ghost kill arrives.
+        // Only definitive outcomes consume credit; a claim or a temporary path failure can clear later.
+        var pending = agent.OwnKillCorpseIds;
+        for (var i = 0; i < pending.Count;)
+        {
+            var id = pending[i];
+            if (squad.CompletedPoiIds.Contains(id) || agent.ValueSkippedPoiIds.Contains(id)
+                || !WasCorpseKilledBySquad(id, squad.Id) || !_waypointCells.ContainsKey(id))
+            {
+                pending.RemoveAt(i);
+                continue;
+            }
+            var corpse = TryGetOwnKillCorpseForAgent(squad, agent, id);
+            if (corpse != null) return corpse;
+            i++;
+        }
+        return null;
     }
 
     /// <summary>
@@ -987,6 +1049,7 @@ public class WaypointSystem
         // the main's zone if they've strayed too far). Self-exclusion below still uses memberPos.
         const float MinSyntheticHopMeters = 10f;
         var center = WorldToCell(searchCenter);
+        var zoneFloor = ZoneFloorForCell(squad, center);
         // Convert radius to cell window. 50m / 75m cell ≈ 1 cell window → search the 3×3 around member. 75m /
         // 50m cell ≈ 2 cell window for tighter cells.
         var cellWindow = Mathf.Max(1, Mathf.CeilToInt(radius / _cellSize));
@@ -1010,9 +1073,9 @@ public class WaypointSystem
         var yTolerance = ServerConfig.MainObjectives.SameFloorLootYTolerance;
         var preferSameFloor = yTolerance > 0f;
         Waypoint bestSameFloor = null;
-        var sameFloorCandidates = 0;
+        var sameFloorCandidates = 0f;
         Waypoint best = null;
-        var candidates = 0;
+        var candidates = 0f;
         for (var dx = -cellWindow; dx <= cellWindow; dx++)
         {
             for (var dy = -cellWindow; dy <= cellWindow; dy++)
@@ -1023,6 +1086,7 @@ public class WaypointSystem
                 for (var i = 0; i < locs.Count; i++)
                 {
                     var loc = locs[i];
+                    if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                     var ok = loc.Category switch
                     {
                         WaypointCategory.LooseLoot => allowLooseLoot,
@@ -1034,6 +1098,7 @@ public class WaypointSystem
                     if (!ok) continue;
                     if (excludeIds != null && excludeIds.Contains(loc.Id)) continue;
                     if (squad != null && squad.CompletedPoiIds.Contains(loc.Id)) continue;
+                    if (HasFailedDoorOnPath(squad, loc)) continue;
                     if (_claims.ContainsKey(loc.Id)) continue;
                     if (IsSquadKnownUnreachable(squad, loc.Id)) continue;
                     // XZ-only distance: the main anchor is Y=0 (CellToWorld / custom zones) while waypoints
@@ -1061,12 +1126,13 @@ public class WaypointSystem
                             && squad.RecentlyVisitedPoiCooldowns.TryGetValue(loc.Id, out var visitExpiry)
                             && Time.time < visitExpiry) continue;
                     }
-                    candidates++;
-                    if (Random.Range(0, candidates) == 0) best = loc;
+                    var weight = ScopedWaypointWeight(squad, loc);
+                    candidates += weight;
+                    if (Random.value * candidates < weight) best = loc;
                     if (preferSameFloor && Mathf.Abs(loc.Position.y - memberPos.y) <= yTolerance)
                     {
-                        sameFloorCandidates++;
-                        if (Random.Range(0, sameFloorCandidates) == 0) bestSameFloor = loc;
+                        sameFloorCandidates += weight;
+                        if (Random.value * sameFloorCandidates < weight) bestSameFloor = loc;
                     }
                 }
             }
@@ -1127,6 +1193,7 @@ public class WaypointSystem
         // whole squad needs to converge.
         if (!IsLootCategory(mainObjective.Category)) return null;
         var center = WorldToCell(mainObjective.Position);
+        var zoneFloor = ZoneFloorForCell(squad, center);
         var radSqr = radius * radius;
         // Two parallel best-picks so we prefer a different loot category from the squad's anchor when
         // possible — gives a 4-PMC squad with a ContainerLoot anchor the chance to spread across container +
@@ -1145,10 +1212,12 @@ public class WaypointSystem
                 for (var i = 0; i < locs.Count; i++)
                 {
                     var loc = locs[i];
+                    if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                     if (!IsLootCategory(loc.Category)) continue;
                     if (loc.Id == mainObjective.Id) continue;
                     if (excludeIds != null && excludeIds.Contains(loc.Id)) continue;
                     if (squad != null && squad.CompletedPoiIds.Contains(loc.Id)) continue;
+                    if (HasFailedDoorOnPath(squad, loc)) continue;
                     if (_claims.ContainsKey(loc.Id)) continue;
                     if (IsSquadKnownUnreachable(squad, loc.Id)) continue;
                     var distSqr = (loc.Position - mainObjective.Position).sqrMagnitude;
@@ -1188,7 +1257,8 @@ public class WaypointSystem
         // The extract-interrupt gate polls this every tick and it now path-checks each candidate (below), so
         // cache the verdict briefly. Reachability from a moving leader changes slowly; 2 s stays responsive
         // without re-pathing every exfil each frame.
-        if (Time.time - squad.NearestExfilCachedAt < NearestExfilCacheTtlSeconds)
+        if (Time.time - squad.NearestExfilCachedAt < NearestExfilCacheTtlSeconds
+            && (squad.NearestExfilCached == null || !squad.CompletedPoiIds.Contains(squad.NearestExfilCached.Id)))
             return squad.NearestExfilCached;
 
         bool? squadIsPmc = null;
@@ -1273,7 +1343,11 @@ public class WaypointSystem
                     continue;
                 }
                 var gapSqr = (corners[corners.Length - 1] - loc.Position).sqrMagnitude;
-                Log.Debug($"{squad} exfil scan: {loc} eligible but path PARTIAL — ends {Mathf.Sqrt(gapSqr):F0}m short");
+                // Where and how far the partial path goes tells a real mesh cut (same end point from anywhere) from
+                // a search that ran out of budget on a long route (the end point follows the leader).
+                var partialLength = 0f;
+                for (var c = 1; c < corners.Length; c++) partialLength += Vector3.Distance(corners[c - 1], corners[c]);
+                Log.Debug($"{squad} exfil scan: {loc} eligible but path PARTIAL — ends {Mathf.Sqrt(gapSqr):F0}m short (from {leaderPos}, {Vector3.Distance(leaderPos, loc.Position):F0}m away, path covers {partialLength:F0}m in {corners.Length} corners and ends at {corners[corners.Length - 1]})");
                 if (gapSqr < bestPartialGapSqr)
                 {
                     bestPartialGapSqr = gapSqr;
@@ -1434,6 +1508,7 @@ public class WaypointSystem
         var squad = agent?.Squad;
         var agentSkips = agent?.ValueSkippedPoiIds;
         var center = WorldToCell(botPos);
+        var zoneFloor = ZoneFloorForCell(squad, center);
         var radSqr = radius * radius;
         // Same-floor preference: track nearest same-floor and nearest overall in parallel, return same-floor
         // when present. Without this, Resort sweeps yo-yo across floors because a basement candidate at low
@@ -1454,10 +1529,14 @@ public class WaypointSystem
                 for (var i = 0; i < locs.Count; i++)
                 {
                     var loc = locs[i];
-                    // All loot categories chain through sweep — excluding containers broke the chain and
+                    if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
+                    // All loot categories chain through sweep, excluding containers broke the chain and
                     // zigzagged the bot to a cell-wide random pick after each container loot.
                     if (!IsLootCategory(loc.Category)) continue;
+                    // A pooled LootItem (picked up, Item restored to null) is not a sweep target.
+                    if (loc.Target is LootItem li && li.Item == null) continue;
                     if (squad != null && squad.CompletedPoiIds.Contains(loc.Id)) continue;
+                    if (HasFailedDoorOnPath(squad, loc)) continue;
                     if (agentSkips != null && agentSkips.Contains(loc.Id)) continue;
                     if (_claims.ContainsKey(loc.Id)) continue;
                     if (IsSquadKnownUnreachable(squad, loc.Id)) continue;
@@ -1528,11 +1607,23 @@ public class WaypointSystem
     }
 
     /// <summary>
-    /// Attempts to reserve a waypoint for an agent. Returns true if the claim was granted, false if another
-    /// agent already holds it. Same agent re-claiming is idempotent.
+    /// True when a loose-loot reference outlived its registry entry or its physical item.
+    /// </summary>
+    public bool IsUnavailableLooseLoot(Waypoint location)
+        => location != null && location.Category == WaypointCategory.LooseLoot
+           && (!_waypointCells.ContainsKey(location.Id) || location.Target == null
+               || (location.Target is LootItem item && item.Item == null));
+
+    /// <summary>
+    /// Reserve an existing waypoint for an agent. Reclaiming one's own reservation is idempotent.
     /// </summary>
     public bool TryClaim(int waypointId, int agentId)
     {
+        if (!_waypointCells.ContainsKey(waypointId))
+        {
+            Log.Debug($"LOOT RECOVERY: denied claim on removed waypoint {waypointId} for agent {agentId}");
+            return false;
+        }
         if (_claims.TryGetValue(waypointId, out var holder))
         {
             var ok = holder == agentId;
@@ -1805,6 +1896,11 @@ public class WaypointSystem
         // (worst with roaming scavs — no main, no home pull, constant RequestFar) until the field blew up.
         var pick = PickFromCell(cell, entity, coords);
         if (pick == null) return null;
+        // A rejected door must reject the assignment before congestion, cooldowns or nearby-loot
+        // dispatch can treat this waypoint as a valid squad anchor.
+        if (entity is Squad unlockSquad && IsSquadPmc(unlockSquad)
+            && !RollForceUnlockForPick(unlockSquad, pick)) return null;
+        if (entity is Squad scopedSquad) LogScopedPick(scopedSquad, coords, pick);
 
         cell.Congestion += 1;
         PropagateForce(coords, 1f);
@@ -1828,18 +1924,15 @@ public class WaypointSystem
             {
                 squad.LastLootCell = coords;
             }
-            // If the picked waypoint sits behind one or more Locked doors, roll for each door whether this
-            // squad is going to force it open on arrival.
-            RollForceUnlockForPick(squad, pick);
         }
         return pick;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void RollForceUnlockForPick(Squad squad, Waypoint pick)
+    private bool RollForceUnlockForPick(Squad squad, Waypoint pick)
     {
         var doors = pick.LockedDoorsOnPath;
-        if (doors == null || doors.Count == 0) return;
+        if (doors == null || doors.Count == 0) return true;
 
         var isMainAnchor = IsWaypointMainAnchorOfSquad(squad, pick);
         var intermediateRaw = squad.Personality != null
@@ -1858,48 +1951,44 @@ public class WaypointSystem
             var doorId = door.GetInstanceID();
             if (squad.ForceUnlockDoorIds.Contains(doorId))
             {
-                // Already granted this raid. A combat retreat / re-dispatch may have re-closed the carver via
-                // the hygiene pass — re-open it now that we're heading back behind this door.
-                if (!DoorNavMesh.IsCarverOpened(doorId))
-                {
-                    DoorNavMesh.OpenCarver(door);
-                    if (!squad.OpenCarverDoors.Contains(door)) squad.OpenCarverDoors.Add(door);
-                }
                 continue;
             }
 
             // Already failed this door for this squad — don't re-roll.
             if (squad.FailedDoorUnlockIds.Contains(doorId))
             {
-                squad.CompletedPoiIds.Add(pick.Id);
-                Log.Info($"{squad} pick {pick} skipped — door {door.Id} previously failed for this squad, blacklisting waypoint");
-                return;
+                Tasks.QuestObjectiveRecovery.Retire(squad, pick, "failed locked door");
+                Log.Debug($"{squad} locked-door assignment rejected: {pick}, door {door.Id} previously refused");
+                return false;
             }
 
             var proba = isMainAnchor ? 1f : intermediateProba;
-            if (proba <= 0f) continue;
-            if (proba >= 1f || Random.value < proba)
+            if (proba >= 1f || proba > 0f && Random.value < proba)
             {
                 squad.ForceUnlockDoorIds.Add(doorId);
-                // Open ONLY the navmesh carver, leaving DoorState Locked. A locked door keeps
-                // Carver_Closed.carving=true, cutting the navmesh across the doorway, so the dispatch path
-                // computed right after this pick would otherwise route AROUND the building (bot stops short
-                // through the wall, 3-fail blacklists the POI). The real unlock (key animation) happens only
-                // when a bot reaches the door in MovementSystem.HandleDoors. DoorNavMesh records it so any
-                // arriving PMC unlocks it, not just this squad.
-                DoorRoutingDiag.LogBefore(squad, pick, door);
-                var carverOpened = DoorNavMesh.OpenCarver(door);
-                if (carverOpened && !squad.OpenCarverDoors.Contains(door)) squad.OpenCarverDoors.Add(door);
-                Log.Info($"{squad} granted force-unlock on door {door.Id} (instance {doorId}) for {pick} — {(isMainAnchor ? "MAIN anchor (100%)" : $"intermediate ({proba:F2})")} — {(carverOpened ? "navmesh carver opened, door stays Locked until a bot arrives" : "NO NavMeshDoorLink found — carver not opened, POI may stay unreachable")}");
             }
             else
             {
                 squad.FailedDoorUnlockIds.Add(doorId);
-                squad.CompletedPoiIds.Add(pick.Id);
-                Log.Info($"{squad} FAILED force-unlock roll on door {door.Id} ({proba:P0}) for {pick} — pick blacklisted, door marked failed (future picks behind this door filtered out)");
-                return;
+                Tasks.QuestObjectiveRecovery.Retire(squad, pick, "locked door skipped");
+                Log.Info($"{squad} locked-door assignment rejected: {pick}, FAILED force-unlock roll on door {door.Id} ({proba:P0}); excluded while locked");
+                return false;
             }
         }
+        // Only prepare navigation once every required door is allowed. A later refusal must not
+        // leave an earlier locked door's carver open for an assignment that will never be issued.
+        for (var i = 0; i < doors.Count; i++)
+        {
+            var door = doors[i];
+            if (door == null || door.DoorState != EDoorState.Locked) continue;
+            var doorId = door.GetInstanceID();
+            if (DoorNavMesh.IsCarverOpened(doorId)) continue;
+            DoorRoutingDiag.LogBefore(squad, pick, door);
+            var carverOpened = DoorNavMesh.OpenCarver(door);
+            if (carverOpened && !squad.OpenCarverDoors.Contains(door)) squad.OpenCarverDoors.Add(door);
+            Log.Info($"{squad} granted force-unlock on door {door.Id} (instance {doorId}) for {pick}: {(isMainAnchor ? "MAIN anchor (100%)" : $"intermediate ({intermediateProba:F2})")}; {(carverOpened ? "navmesh carver opened, door stays Locked until a bot arrives" : "NO NavMeshDoorLink found, carver not opened, POI may stay unreachable")}");
+        }
+        return true;
     }
 
     // Waypoint is filtered out if any door on its path is in the squad's FailedDoorUnlockIds AND still in
@@ -1957,6 +2046,7 @@ public class WaypointSystem
             // get picked via the reservoir-sample path which respects the cooldown.
             if (m.Type == MainObjectiveType.Kills)
             {
+                if (!MatchesZoneFloor(m.ZoneFloorId, loc.Position)) continue;
                 if (locCell == m.CellCoords
                     && (loc.Category == WaypointCategory.ContainerLoot
                         || loc.Category == WaypointCategory.LooseLoot
@@ -1986,11 +2076,19 @@ public class WaypointSystem
     private float? ResolveSquadFloor(Squad squad, Vector2Int coords, List<Waypoint> waypoints, float tolerance)
     {
         if (tolerance <= 0f) return null;
-        if (squad.CellFloorAssignments.TryGetValue(coords, out var existing)) return existing;
+        var zoneFloor = ZoneFloorForCell(squad, coords);
+        if (squad.CellFloorAssignments.TryGetValue(coords, out var existing))
+        {
+            if (string.IsNullOrEmpty(zoneFloor)) return existing;
+            foreach (var point in waypoints)
+                if (MatchesZoneFloor(zoneFloor, point.Position) && Mathf.Abs(point.Position.y - existing) <= tolerance) return existing;
+            squad.CellFloorAssignments.Remove(coords);
+        }
         var floors = _floorScratch;
         floors.Clear();
         for (var i = 0; i < waypoints.Count; i++)
         {
+            if (!MatchesZoneFloor(zoneFloor, waypoints[i].Position)) continue;
             var y = waypoints[i].Position.y;
             var matched = false;
             for (var f = 0; f < floors.Count; f++)
@@ -2016,12 +2114,14 @@ public class WaypointSystem
         float tolerance, HashSet<float> exhaustedFloors, out float newFloorY)
     {
         newFloorY = 0f;
+        var zoneFloor = ZoneFloorForCell(squad, coords);
         var candidatesPerFloor = _floorScratch;
         candidatesPerFloor.Clear();
         var nowForVisitCheck = Time.time;
         for (var i = 0; i < waypoints.Count; i++)
         {
             var loc = waypoints[i];
+            if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
             var alreadyExhausted = false;
             foreach (var ex in exhaustedFloors)
                 if (Mathf.Abs(loc.Position.y - ex) <= tolerance) { alreadyExhausted = true; break; }
@@ -2114,6 +2214,7 @@ public class WaypointSystem
                                      && !CellHasRuntimeLootPoi(cell);
             var corpseGate = CorpseRequiresSightOrSquadKillForSquad(squad);
             var waypoints = cell.Waypoints;
+            var zoneFloor = ZoneFloorForCell(squad, coords);
 
             // Multi-floor cell handling. If this cell has POIs spread across multiple Y clusters and the squad
             // hasn't already committed to a floor, pick one at random — keeps cleaning order varied between
@@ -2128,6 +2229,7 @@ public class WaypointSystem
             for (var i = 0; i < waypoints.Count; i++)
             {
                 var loc = waypoints[i];
+                if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                 if (loc.Category != WaypointCategory.Corpse) continue;
                 if (!IsRuntimeWaypoint(loc)) continue;
                 if (!WasCorpseKilledBySquad(loc.Id, squad.Id)) continue;
@@ -2146,6 +2248,7 @@ public class WaypointSystem
             for (var i = 0; i < waypoints.Count; i++)
             {
                 var loc = waypoints[i];
+                if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                 if (!IsWaypointMainAnchorOfSquad(squad, loc)) continue;
                 // Apply the standard hard filters before priority-picking.
                 if (loc.Category == WaypointCategory.Quest && !SquadOwnsQuest(squad, loc)) continue;
@@ -2171,7 +2274,7 @@ public class WaypointSystem
             }
 
             Waypoint pick = null;
-            var candidates = 0;
+            var candidates = 0f;
             var skippedBlacklist = 0;
             var skippedExfil = 0;
             var skippedUnreachable = 0;
@@ -2184,6 +2287,7 @@ public class WaypointSystem
             for (var i = 0; i < waypoints.Count; i++)
             {
                 var loc = waypoints[i];
+                if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                 if (loc.Category == WaypointCategory.Exfil
                     && (!squad.ExtractRequested || loc != squad.NearestExfilCached))
                 {
@@ -2255,8 +2359,9 @@ public class WaypointSystem
                 }
                 if (floorFilterActive && loc.Category != WaypointCategory.Quest
                     && Mathf.Abs(loc.Position.y - floorY.Value) > floorTolerance) continue;
-                candidates++;
-                if (Random.Range(0, candidates) == 0)
+                var weight = ScopedWaypointWeight(squad, loc);
+                candidates += weight;
+                if (Random.value * candidates < weight)
                     pick = loc;
             }
             if (pick != null)
@@ -2292,11 +2397,12 @@ public class WaypointSystem
 
             // Fallback: re-pick relaxing ONLY the detour-distance cap. Every other filter stays in effect to
             // avoid sending bots to genuinely unreachable / immersion-breaking targets.
-            var fallbackCandidates = 0;
+            var fallbackCandidates = 0f;
             Waypoint fallbackPick = null;
             for (var i = 0; i < waypoints.Count; i++)
             {
                 var loc = waypoints[i];
+                if (!MatchesDestinationFloor(zoneFloor, loc)) continue;
                 if (loc.Category == WaypointCategory.Exfil && !squad.ExtractRequested) continue;
                 if (loc.Category == WaypointCategory.Quest
                     && !SquadOwnsQuest(squad, loc)) continue;
@@ -2309,8 +2415,10 @@ public class WaypointSystem
                     && !HasLineOfSightToCorpse(squad, loc)) continue;
                 if (IsSquadKnownUnreachable(squad, loc.Id)) continue;
                 if (!SquadCanUseWaypoint(squad, squadIsPmc, loc)) continue;
-                fallbackCandidates++;
-                if (Random.Range(0, fallbackCandidates) == 0)
+                if (HasFailedDoorOnPath(squad, loc)) continue;
+                var weight = ScopedWaypointWeight(squad, loc);
+                fallbackCandidates += weight;
+                if (Random.value * fallbackCandidates < weight)
                     fallbackPick = loc;
             }
             if (fallbackPick != null) return fallbackPick;
@@ -2990,12 +3098,17 @@ public class WaypointSystem
         return false;
     }
 
-    public readonly struct Zone(Vector2 coords, float radius, float force, float decay)
+    public readonly struct Zone(Vector2 coords, float radius, float force, float decay,
+        ZoneScope scope = null, Vector3 worldPosition = default, bool killMains = false)
     {
         public readonly Vector2 Coords = coords;
         public readonly float Radius = radius;
         public readonly float Force = force;
         public readonly float Decay = decay;
+        public readonly ZoneScope Scope = scope;
+        public readonly Vector3 WorldPosition = worldPosition;
+        public readonly bool KillMains = killMains;
+        public bool IsScoped => Scope != null && (Scope.BotTypes != null || !string.IsNullOrEmpty(Scope.FloorId));
 
         public override string ToString()
             => $"Zone(position: {Coords}, radius: {Radius}, force: {Force}, decay: {Decay})";

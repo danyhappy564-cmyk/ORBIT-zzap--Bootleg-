@@ -194,6 +194,8 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
 
             CheckTimeExtractTrigger(squad);
 
+            if (TryContinueLootExtractSweep(squad)) continue;
+
             // Extract interrupt: bee-line to the exfil the instant ExtractRequested is set, rather than letting
             // the squad finish (and wait out) its current objective first. Gated on an eligible exfil existing
             // so we don't churn a re-dispatch every tick when none is reachable.
@@ -245,6 +247,38 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 }
             }
 
+            // Ghost hearing: the sleeping squad heard a firefight and rolled "go and look" (DormancySystem).
+            // Same interrupt shape as the opportunistic corpse, minus the resume: once there, the normal
+            // flow takes over (a ghost contact, bodies to loot, or simply the next objective).
+            if (squad.InvestigateNoisePosition.HasValue)
+            {
+                var noisePos = squad.InvestigateNoisePosition.Value;
+                squad.InvestigateNoisePosition = null;
+                if (!squad.ExtractRequested
+                    && squad.CombatCallerMemberIdx < 0
+                    && squad.PreInterruptObjectiveLocation == null
+                    && (squadObjective.Location == null || squadObjective.Location.Category != WaypointCategory.Corpse))
+                {
+                    var previous = squadObjective.Location;
+                    var investigate = waypointSystem.RequestForInvestigation(squad, noisePos);
+                    if (investigate != null)
+                    {
+                        squadObjective.LocationPrevious = previous;
+                        squadObjective.Location = investigate;
+                        squadObjective.Status = SquadObjectiveState.Active;
+                        ShufflePickCoverPoints(squadObjective, Math.Max(squad.TargetMembersCount, squad.Size));
+                        ResetDuration(squadObjective, _moveTimeout.SampleGaussian());
+                        Log.Info($"{squad} noise investigation: heading to {investigate} near the gunfire at {noisePos}, was on {previous}");
+                        continue; // re-enter on next tick; UpdateAgents will realign members
+                    }
+                    Log.Debug($"{squad} noise investigation: no usable waypoint around {noisePos}, staying on {previous}");
+                }
+            }
+            // Do not re-arm Failed on a consumed loose item. Pending pickup sessions get their action
+            // tick first, so their successful result and extraction checks are preserved.
+            if (LooseLootRecovery.PrepareSquad(squad, waypointSystem))
+                continue;
+
             if (squadObjective.Location == null)
             {
                 // Honour an explicit post-rescue (or other) cooldown set by a patch that nulled the location:
@@ -256,12 +290,14 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 {
                     continue;
                 }
-                Log.Debug($"{squad} objective is null, requesting new assignment");
                 AssignNewObjective(squad);
                 continue;
             }
 
-            var finishedCount = UpdateAgents(squad);
+            var finishedCount = UpdateAgents(squad, out var locallyExhaustedLootCount);
+
+            if (TryAdvanceExhaustedLoot(squad, finishedCount, locallyExhaustedLootCount))
+                continue;
 
             if (finishedCount == squad.Size)
             {
@@ -301,6 +337,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                         && squadObjective.Location.Category != WaypointCategory.Exfil)
                     {
                         squad.CompletedPoiIds.Add(squadObjective.Location.Id);
+                        QuestObjectiveRecovery.Retire(squad, squadObjective.Location, "repeated en-route failures");
                         Log.Info($"{squad} blacklisting unreachable {squadObjective.Location} after {UnreachableBlacklistThreshold} consecutive en-route failures (squad memory size={squad.CompletedPoiIds.Count})");
                         squad.ConsecutiveFailedDispatches = 0;
                         AssignNewObjective(squad);
@@ -507,7 +544,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         var stagnantLow = agent.EmergencyLowSince >= 0f
                           && Time.time - agent.EmergencyLowSince >= EmergencyStagnantLowSeconds;
 
-        if (agent.SoloExtractRequested || (!activeDecline && !stagnantLow)) return;
+        if ((agent.SoloExtractRequested && agent.LootExtractSweep == null) || (!activeDecline && !stagnantLow)) return;
 
         agent.SoloExtractRequested = true;
         agent.SoloExtractIsEmergency = true;
@@ -585,10 +622,18 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         return max > 0f ? cur / max : 1f;
     }
 
-    private int UpdateAgents(Squad squad)
+    private bool TryContinueLootExtractSweep(Squad squad)
+    {
+        if (squad.LootExtractSweep?.Maintain(waypointSystem) != true) return false;
+        UpdateAgents(squad, out _);
+        return true;
+    }
+
+    private int UpdateAgents(Squad squad, out int locallyExhaustedLootCount)
     {
         var squadObjective = squad.Objective;
         var finishedCount = 0;
+        locallyExhaustedLootCount = 0;
         _splinterScratch.Clear();
 
         // Independent-dispatch mode: each member picks their own roam splinter (extended radius + category
@@ -610,6 +655,10 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         var roamContainerLoot = useRoam;
         var roamCorpse = useRoam;
         var roamSynthetic = useRoam && activeType == MainObjectiveType.Kills;
+        var trackLootExhaustion = useRoam && activeType == MainObjectiveType.LootValue
+                                 && activeMain.LootValueEnteredAt > 0f
+                                 && squadObjective.Location != null
+                                 && IsLootPoi(squadObjective.Location.Category);
 
         for (var i = 0; i < squad.Size; i++)
         {
@@ -632,17 +681,34 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
             // Solo / emergency extract: a wounded member peels off to its own exfil, skipping squad alignment +
             // splinter logic so the rest keep playing. The arrival handler flips it to Extracting from there.
             UpdateEmergencyExtract(agent);
+            if (agent.LootExtractSweep?.Maintain(waypointSystem) == true)
+            {
+                if (agent.SoloExtractRequested) finishedCount++;
+                continue;
+            }
             if (agent.SoloExtractRequested)
             {
+                if (agent.SoloExtractTarget != null && squad.CompletedPoiIds.Contains(agent.SoloExtractTarget.Id))
+                    ExfilArrival.Abandon(agent, agent.SoloExtractTarget);
+                if (agent.IsActive && agent.SoloExtractTarget?.Target is EFT.Interactive.ExfiltrationPoint soloExfil
+                    && ExfilArrival.IsSharedTimer(soloExfil) && ExfilArrival.IsUnavailable(soloExfil))
+                {
+                    Log.Info($"{agent} solo V-Ex {soloExfil.name} unavailable, selecting another exfil");
+                    ExfilArrival.Abandon(agent, agent.SoloExtractTarget);
+                }
                 if (agent.SoloExtractTarget == null)
                     agent.SoloExtractTarget = waypointSystem.FindNearestEligibleExfil(squad);
                 if (agent.SoloExtractTarget != null)
                 {
                     // Re-arm the move order rather than issuing it once: a SAIN-combat detour drops the
                     // destination and an arrival stall flips it to Failed, either of which strands the bot near
-                    // the exfil with no way back into the arrival->Extracting handler.
+                    // the exfil with no way back into the arrival->Extracting handler. None is not stalled: it is
+                    // the armed state itself, waiting for GotoObjectiveAction, which cannot run while SAIN holds
+                    // the bot. An emergency extract usually fires mid-fight, and counting None re-armed the same
+                    // order every tick for the whole fight (257 "lost its move order" lines in two raids).
                     var firstDispatch = agentObjective.Location != agent.SoloExtractTarget;
                     var stalled = !firstDispatch
+                                  && agentObjective.Status != ObjectiveStatus.None
                                   && agentObjective.Status != ObjectiveStatus.Moving
                                   && agentObjective.Status != ObjectiveStatus.Extracting;
                     if (firstDispatch || stalled)
@@ -705,12 +771,10 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
             // Fix A: an agent still owed its own kill's corpse must not stay stuck on a lower-priority loot
             // splinter (or any non-corpse objective). Resolve the re-route here so the alignment check treats it
             // as misaligned and the dispatch block below routes it to its body. Computed once, reused there.
-            Waypoint ownKillReroute = null;
-            if (agent.OwnKillCorpseLocId != 0)
-            {
-                ownKillReroute = waypointSystem.TryGetOwnKillCorpseForAgent(squad, agent, agent.OwnKillCorpseLocId);
-                if (ownKillReroute == null) agent.OwnKillCorpseLocId = 0;
-            }
+            // A new corpse must never cancel an in-flight search/transfer on the current body.
+            if (agentObjective.Status == ObjectiveStatus.Looting || agent.LootHandler?.LootTaskRunning == true)
+                continue;
+            var ownKillReroute = waypointSystem.TryGetNextOwnKillCorpseForAgent(squad, agent);
             var aligned = !splinterAlreadyDone && !leaderFinishedAnchorInRoam
                           && (ownKillReroute == null || agentObjective.Location == ownKillReroute)
                           && (agentObjective.Location == squadObjective.Location
@@ -720,14 +784,6 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
             if (leaderFinishedAnchorInRoam)
             {
                 Log.Debug($"{agent} leader roam continuation: finished anchor {agentObjective.Location}, picking a splinter instead of guarding");
-                // A double-kill only arms the single PendingOwnKill slot for the latest corpse; the earlier
-                // tagged kill is never re-picked here (roam splinters bypass RequestNear's own-kill pre-scan).
-                // Force a squad re-dispatch so the pre-scan re-anchors onto it before roaming off.
-                if (waypointSystem.TryPickOwnKillCorpse(squad) != null)
-                {
-                    squad.Objective.Duration = 0;
-                    Log.Info($"{agent} finished an own-kill corpse but another tagged own-kill is still unlooted nearby — forcing squad re-anchor onto it before roaming");
-                }
             }
 
             if (aligned && agentObjective.Location != null)
@@ -755,8 +811,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
             {
                 // Dispatch priority:
                 //   1. Own-kill direct: the specific agent who landed the
-                // fresh corpse kill goes straight to that corpse, not a random splinter around it. Cleared
-                // after first use.
+                // corpse kill goes to its oldest eligible pending body, not a random splinter.
                 //   2. Anchor-first for the leader (i=0): exactly one
                 // member works the anchor itself, others get splinters. Solo squads naturally end up here
                 // too, so the bot loots the anchor before its splinters. Falls through to the splinter branch
@@ -767,11 +822,10 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 //   5. Fallback to squad anchor (no splinter found).
                 Waypoint targetLoc;
                 Waypoint splinterParent;
+                var locallyExhausted = false;
                 var tookOwnKillCorpse = false;
-                var ownKillAgentId = squad.PendingOwnKillKillerAgentId;
-                var anchorReservedForOwnKill = ownKillAgentId >= 0
-                                               && squadObjective.Location != null
-                                               && squadObjective.Location.Id == squad.PendingOwnKillCorpseLocId;
+                var anchorReservedForOwnKill = squadObjective.Location != null
+                                               && AnyMemberDesignatedForCorpse(squad, squadObjective.Location.Id);
                 // Persistent own-kill re-route (highest priority): resolved above, where it also broke this
                 // agent's sticky-splinter alignment so we reach here. A killer pulled off its body by combat /
                 // heal / solo-extract is routed straight back to it.
@@ -780,24 +834,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                     targetLoc = ownKillReroute;
                     splinterParent = squadObjective.Location;
                     tookOwnKillCorpse = true;
-                    // Consume the one-shot squad pending for this same body even when the anchor hasn't flipped
-                    // onto it yet — leaving it armed re-fires a second direct-route (and a second full loot
-                    // session) on a corpse the killer has already emptied.
-                    if (agent.Id == ownKillAgentId && squad.PendingOwnKillCorpseLocId == ownKillReroute.Id)
-                    {
-                        squad.PendingOwnKillKillerAgentId = -1;
-                        squad.PendingOwnKillCorpseLocId = 0;
-                    }
                     Log.Debug($"{agent} own-kill re-route to its corpse {targetLoc} (reactivated after a combat / heal / extract detour)");
-                }
-                else if (anchorReservedForOwnKill && agent.Id == ownKillAgentId)
-                {
-                    targetLoc = squadObjective.Location;
-                    splinterParent = null;
-                    tookOwnKillCorpse = true;
-                    squad.PendingOwnKillKillerAgentId = -1;
-                    squad.PendingOwnKillCorpseLocId = 0;
-                    Log.Debug($"{agent} own-kill direct-route to {targetLoc} (skipped splinter)");
                 }
                 else if (i == 0
                          && !anchorReservedForOwnKill
@@ -846,11 +883,15 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                     else if (squadObjective.Location != null
                              && (squadObjective.Location.Position - agent.Position).sqrMagnitude <= squadObjective.Location.RadiusSqr)
                     {
-                        // No roam splinter left and this member is already on the anchor; re-picking it just
-                        // loops every tick without moving. Null it so it settles into a guard and the squad wait
-                        // timer (or cell-clean completion) moves the squad on.
+                        // This search, rather than an arbitrary null objective, proves local exhaustion.
+                        // Once all members settle, re-evaluate the wider cell instead of waiting at this POI.
                         targetLoc = null;
                         splinterParent = null;
+                        if (trackLootExhaustion)
+                        {
+                            locallyExhausted = true;
+                            locallyExhaustedLootCount++;
+                        }
                     }
                     else
                     {
@@ -894,12 +935,8 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 {
                     if (i == 0 && !AnyMemberDesignatedForCorpse(squad, targetLoc.Id))
                     {
-                        // No designated killer is coming for this anchored body (own-kill memory cleared by the
-                        // distance gate, or the killer left the squad). The leader keeps it and goes to loot it —
-                        // nulling everyone here left the squad frozen around an unlooted corpse anchor it could
-                        // never complete. Keyed on the members' agent-level own-kill memory, NOT the one-shot
-                        // squad pending: that slot is consumed at the killer's FIRST dispatch, so testing it
-                        // would send the leader racing the still-travelling killer for the claim.
+                        // No eligible killer is currently coming for this body. The leader may take it
+                        // rather than parking the whole squad around an unreachable follower's queue.
                     }
                     else
                     {
@@ -924,6 +961,12 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                     }
                 }
 
+                // Keep searching on later ticks (claims can be released and corpses can appear), but do not
+                // repeatedly reset/log the same empty assignment while another member is still looting.
+                if (locallyExhausted && agentObjective.Location == null
+                    && agentObjective.SplinterParent == null && agentObjective.Status == ObjectiveStatus.None)
+                    continue;
+
                 agentObjective.Location = targetLoc;
                 agentObjective.SplinterParent = splinterParent;
                 agentObjective.DispatchTime = Time.time;
@@ -931,7 +974,14 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 // Distance check / already-in-radius short-circuit is per- AGENT (against their splinter or
                 // the squad anchor — whichever they got), not per-squad. Without this followers with a
                 // splinter would inherit the squad- anchor distance check and deadlock.
-                if (targetLoc != null)
+                if (targetLoc?.Category == WaypointCategory.Exfil)
+                {
+                    // Being above a bunker is inside its loose radius, not an extraction arrival.
+                    // Goto owns the real trigger check and the existing local fallback timeout.
+                    agentObjective.Status = ObjectiveStatus.None;
+                    agentObjective.ExfilOutsideTriggerSince = -1f;
+                }
+                else if (targetLoc != null)
                 {
                     var distSqr = (targetLoc.Position - agent.Position).sqrMagnitude;
                     if (distSqr <= targetLoc.RadiusSqr)
@@ -1046,6 +1096,39 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         return finishedCount;
     }
 
+    private bool TryAdvanceExhaustedLoot(Squad squad, int finishedCount, int locallyExhaustedCount)
+    {
+        // UpdateAgents reports exhaustion only after a LootValue local search found no eligible target
+        // while the member was already at a loot anchor. Unknown nulls and failed travel do not qualify.
+        if (locallyExhaustedCount == 0 || finishedCount + locallyExhaustedCount != squad.Size
+            || squad.ExtractRequested || squad.CombatCallerMemberIdx >= 0
+            || squad.PreInterruptObjectiveLocation != null || Time.time < squad.GhostFightUntil
+            || waypointSystem.IsClaimed(squad.Objective.Location.Id))
+            return false;
+
+        for (var i = 0; i < squad.Size; i++)
+        {
+            var member = squad.Members[i];
+            if (!member.IsActive || member.SoloExtractRequested
+                || member.Bot?.Memory is { HaveEnemy: true } or { IsUnderFire: true }
+                || member.LootHandler is { LootTaskRunning: true }
+                || (member.Objective.Location != null && waypointSystem.IsClaimed(member.Objective.Location.Id))
+                || member.Objective.Status == ObjectiveStatus.Failed)
+                return false;
+        }
+
+        var objective = squad.Objective;
+        // A null/unchanged result still uses the cooldown. Do not fall through to the expired generic
+        // wait timer and bypass it. Active members continue through the normal dispatch path above.
+        if (Time.time < objective.NextLootExhaustionRecheckAt) return true;
+        objective.NextLootExhaustionRecheckAt = Time.time + 2f;
+        Log.Debug($"{squad} local loot exhausted: {locallyExhaustedCount} without a target, {finishedCount} finished; re-evaluating {objective.Location}");
+        // RequestNear applies the normal claims, floor and reachability checks. Exhausting a local
+        // radius alone never marks the main cell clean or increments an en-route failure streak.
+        AssignNewObjective(squad, completedCurrent: true);
+        return true;
+    }
+
     // ── Main objectives: tick + completion + extract trigger ────────
     //
     // Walks the squad's pending main objectives each tick. Per type: Kills: enter roam phase when any member
@@ -1090,7 +1173,9 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                 {
                     for (var i = 0; i < squad.Size; i++)
                     {
-                        if (waypointSystem.WorldToCell(squad.Members[i].Position) == main.CellCoords)
+                        if (waypointSystem.WorldToCell(squad.Members[i].Position) == main.CellCoords
+                            && !squad.Members[i].Bot.IsDead
+                            && waypointSystem.MatchesZoneFloorAtTarget(main.ZoneFloorId, main.Position, squad.Members[i].Position))
                         {
                             main.KillsRoamStartedAt = now;
                             Log.Info($"{squad} Kills main at {main.CellCoords} entered roam phase (member {i} in cell, {main.KillsRoamTargetDuration:F0}s)");
@@ -1098,12 +1183,29 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
                         }
                     }
                 }
+                // Scoped mains count time spent on their actual floor. Legacy mains keep their timer.
+                var elapsed = now - main.KillsRoamStartedAt;
+                if (!string.IsNullOrEmpty(main.ZoneFloorId))
+                {
+                    var onFloor = false;
+                    for (var i = 0; i < squad.Size; i++)
+                        if (!squad.Members[i].Bot.IsDead
+                            && waypointSystem.MatchesZoneFloorAtTarget(main.ZoneFloorId, main.Position, squad.Members[i].Position))
+                            onFloor = true;
+                    if (main.KillsRoamStartedAt > 0f && onFloor)
+                    {
+                        if (main.KillsFloorLastTick > 0f) main.KillsFloorElapsed += now - main.KillsFloorLastTick;
+                        main.KillsFloorLastTick = now;
+                    }
+                    else main.KillsFloorLastTick = 0f;
+                    elapsed = main.KillsFloorElapsed;
+                }
                 // Phase 2: timer-based completion
                 if (main.KillsRoamStartedAt > 0f
-                    && now - main.KillsRoamStartedAt >= main.KillsRoamTargetDuration)
+                    && elapsed >= main.KillsRoamTargetDuration)
                 {
                     main.Completed = true;
-                    Log.Info($"{squad} Kills main at {main.CellCoords} completed after {now - main.KillsRoamStartedAt:F0}s roam");
+                    Log.Info($"{squad} Kills main at {main.CellCoords} completed after {elapsed:F0}s roam");
                 }
                 break;
 
@@ -1358,7 +1460,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
 
     private static void CheckTimeExtractTrigger(Squad squad)
     {
-        if (squad.ExtractRequested) return;
+        if (squad.ExtractRequested && squad.LootExtractSweep == null) return;
         var leaderBot = squad?.Leader?.Bot;
         if (leaderBot?.Profile?.Info?.Settings == null) return;
         var role = leaderBot.Profile.Info.Settings.Role;
@@ -1401,19 +1503,17 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
     // hung, so force-blacklist and re-dispatch.
     private const float CorpseStuckTimeoutSeconds = 180f;
 
-    // True when a LIVE member is designated to loot this corpse — via their agent-level own-kill memory
-    // (branch-1 re-route will take them there) or via the still-armed squad pending (branch-2 direct-route).
-    // A designation held by an agent who left the squad doesn't count: nobody is coming, the body is up for
-    // grabs by the leader.
-    private static bool AnyMemberDesignatedForCorpse(Squad squad, int locId)
+    // A pending corpse is reserved for its killer while that agent remains in the squad.
+    private bool AnyMemberDesignatedForCorpse(Squad squad, int locId)
     {
         if (squad?.Members == null) return false;
         for (var i = 0; i < squad.Members.Count; i++)
         {
             var m = squad.Members[i];
             if (m == null) continue;
-            if (m.OwnKillCorpseLocId == locId) return true;
-            if (squad.PendingOwnKillCorpseLocId == locId && squad.PendingOwnKillKillerAgentId == m.Id) return true;
+            if (m.OwnKillCorpseIds.Contains(locId) && !m.ValueSkippedPoiIds.Contains(locId)
+                && (waypointSystem.IsClaimed(locId)
+                    || waypointSystem.TryGetOwnKillCorpseForAgent(squad, m, locId) != null)) return true;
         }
         return false;
     }
@@ -1455,6 +1555,11 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
 
     private void AssignNewObjective(Squad squad, bool completedCurrent = false)
     {
+        // A null result must not rescan every cell on every strategy tick. Real movement or a new
+        // extraction request can bypass the short backoff; an unchanged failure cannot.
+        if (Time.time < squad.NextDispatchAttemptAt
+            && squad.ExtractRequested == squad.FailedDispatchWasExtract
+            && (squad.Leader.Bot.Position - squad.FailedDispatchPosition).sqrMagnitude < 9f) return;
         var objective = squad.Objective;
 
         // Synthetic POIs get a short-term visit cooldown so the squad doesn't ping-pong on the same
@@ -1517,9 +1622,11 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
             // pool has collapsed to a single exhausted candidate (value-skips are per-agent, so the POI
             // never enters CompletedPoiIds on its own, and loot waits are zero-duration — nothing else
             // breaks the cycle). Squad-complete it and re-pick once; en-route failures keep their own
-            // 3-strike blacklist path via completedCurrent=false.
+            // 3-strike blacklist path via completedCurrent=false. Corpses are completed by loot outcomes,
+            // never by timer expiry or by selecting the same still-unlooted body again.
             if (completedCurrent && newLocation != null && objective.Location != null
                 && newLocation.Id == objective.Location.Id
+                && newLocation.Category != WaypointCategory.Corpse
                 && IsLootPoi(newLocation.Category))
             {
                 squad.CompletedPoiIds.Add(newLocation.Id);
@@ -1531,6 +1638,13 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         if (newLocation == null)
         {
             squad.ConsecutiveDispatchFailures++;
+            var delay = squad.ConsecutiveDispatchFailures == 1 ? .5f
+                : squad.ConsecutiveDispatchFailures == 2 ? 1f
+                : squad.ConsecutiveDispatchFailures == 3 ? 2f : 5f;
+            squad.NextDispatchAttemptAt = Time.time + delay;
+            squad.FailedDispatchWasExtract = squad.ExtractRequested;
+            squad.FailedDispatchPosition = squad.Leader.Bot.Position;
+            Log.Debug($"{squad} dispatch backoff: no eligible objective, retry in {delay:F1}s");
             Log.Debug($"{squad} received null objective location (consecutive failures: {squad.ConsecutiveDispatchFailures})");
             return;
         }
@@ -1538,6 +1652,7 @@ public class GotoObjectiveStrategy(SquadData squadData, WaypointSystem waypointS
         // Successful dispatch — reset the islanded counter so we don't pin a squad to its cell forever after
         // one good streak of failures.
         squad.ConsecutiveDispatchFailures = 0;
+        squad.NextDispatchAttemptAt = 0f;
 
         objective.LocationPrevious = objective.Location;
         objective.Location = newLocation;

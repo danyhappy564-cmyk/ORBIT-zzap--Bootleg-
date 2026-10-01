@@ -139,7 +139,7 @@ public static class WeaponSwapper
         return new WouldSwapResult(false, candidateScore);
     }
 
-    public static async Task<Outcome> TryHandleAsync(BotOwner bot, Weapon candidate, Item rootSource, CancellationToken ct)
+    public static async Task<Outcome> TryHandleAsync(BotOwner bot, Weapon candidate, Item rootSource, CancellationToken ct, bool dormant = false)
     {
         if (ServerConfig.Loot.KeepSpawnWeapons) return Outcome.NotApplicable;
         if (bot == null || candidate == null) return Outcome.NotApplicable;
@@ -153,9 +153,97 @@ public static class WeaponSwapper
 
         var outcome = isBotScav
             ? await TryEquipIntoFirstEmptySlotAsync(bot, candidate, nick, ct)
-            : await EvaluateAndPerformAsync(bot, candidate, rootSource, nick, ct);
-        if (outcome == Outcome.Swapped) await FinalizeWeaponSwapAsync(bot, nick, ct);
+            : await EvaluateAndPerformAsync(bot, candidate, rootSource, nick, ct, dormant);
+        if (outcome == Outcome.Swapped)
+        {
+            if (dormant) RegisterDormantEquip(bot, candidate, nick);
+            else await FinalizeWeaponSwapAsync(bot, nick, ct);
+        }
         return outcome;
+    }
+
+    // ── Ghost gear swaps ────────────────────────────────────────────────────────────────────────────
+    // The policy above is already hands-safe in its first half: a candidate always lands in an EMPTY slot or
+    // takes primary2's place, and only then is promoted by swapping slot1 and slot2. That promotion, and the
+    // final redraw, are the only steps that move the weapon in hands, which needs a live body. A sleeper
+    // therefore runs the first half as is and leaves two notes on its agent: redraw at wake, promote at the
+    // next awake loot session (a calm moment, never the second a sleeper is woken by a fight).
+
+    public static bool IsInHands(BotOwner bot, Item item)
+    {
+        try { return item != null && ReferenceEquals(bot?.GetPlayer?.HandsController?.Item, item); }
+        catch { return false; }
+    }
+
+    private static void RegisterDormantEquip(BotOwner bot, Weapon candidate, string nick)
+    {
+        var agent = Singleton<BotRoster>.Instance?.GetAgent(bot);
+        if (agent == null) return;
+        agent.GhostHandsResync = true;
+        // First primary was empty: the candidate IS the main weapon from now on.
+        var primary1 = bot.GetPlayer?.Inventory?.Equipment?.GetSlot(EquipmentSlot.FirstPrimaryWeapon)?.ContainedItem;
+        if (ReferenceEquals(primary1, candidate)) agent.GhostBestWeapon = candidate;
+        Log.Info($"WeaponSwap({nick}): ghost equipped {candidate.LocalizedName()} without drawing it, hands resync queued for the wake");
+    }
+
+    private static void RegisterPendingPromotion(BotOwner bot, Weapon candidate, string nick)
+    {
+        var agent = Singleton<BotRoster>.Instance?.GetAgent(bot);
+        if (agent == null) return;
+        agent.GhostPendingPromotion = candidate;
+        agent.GhostBestWeapon = candidate;
+        Log.Info($"WeaponSwap({nick}): ghost parked {candidate.LocalizedName()} in primary2, promotion to primary1 deferred to its next awake loot session");
+    }
+
+    /// <summary>Wake resync: the weapon list changed while the body was inactive. Same refresh as the end of
+    /// an awake swap, so BSG and SAIN see the new loadout and the main weapon is drawn.</summary>
+    public static void ResyncHandsAfterWake(BotOwner bot, string who)
+    {
+        try
+        {
+            var selector = bot?.WeaponManager?.Selector;
+            if (selector == null) return;
+            selector.UpdateWeaponsList();
+            selector.ChangeToMain();
+            try { bot.AIData?.CalcPower(); } catch { }
+            Log.Info($"{who} woke with gear equipped while asleep: weapon list refreshed, main weapon redrawn");
+        }
+        catch (System.Exception e)
+        {
+            Log.Warning($"{who} hands resync after wake threw: {e.Message}");
+        }
+    }
+
+    /// <summary>Second half of a swap a sleeper could not finish: promote the parked weapon to primary1.
+    /// Called from an awake loot session. The note is cleared whatever happens, the weapon stays a valid
+    /// secondary if the swap is refused.</summary>
+    public static async Task PromotePendingAsync(BotOwner bot, CancellationToken ct)
+    {
+        var agent = Singleton<BotRoster>.Instance?.GetAgent(bot);
+        var candidate = agent?.GhostPendingPromotion;
+        if (candidate == null || agent.IsDormant) return;
+        agent.GhostPendingPromotion = null;
+        agent.GhostBestWeapon = null;
+        var nick = bot.Profile?.Nickname ?? "(no-nick)";
+        try
+        {
+            var equipment = bot.GetPlayer?.Inventory?.Equipment;
+            var current1 = equipment?.GetSlot(EquipmentSlot.FirstPrimaryWeapon)?.ContainedItem as Weapon;
+            var current2 = equipment?.GetSlot(EquipmentSlot.SecondPrimaryWeapon)?.ContainedItem as Weapon;
+            if (current1 == null || !ReferenceEquals(current2, candidate))
+            {
+                Log.Debug($"WeaponSwap({nick}): pending promotion dropped, {candidate.LocalizedName()} is no longer parked in primary2");
+                return;
+            }
+            Log.Info($"WeaponSwap({nick}): promoting {candidate.LocalizedName()} to primary1 (parked there while asleep), demoting {current1.LocalizedName()}");
+            if (await SwapInPlaceAsync(bot, candidate, current1, nick, ct))
+                await FinalizeWeaponSwapAsync(bot, nick, ct);
+        }
+        catch (System.OperationCanceledException) { throw; }
+        catch (System.Exception e)
+        {
+            Log.Warning($"WeaponSwap({nick}): pending promotion threw: {e.Message}");
+        }
     }
 
     private static readonly EquipmentSlot[] WeaponSlotsPrimaryFirst =
@@ -170,13 +258,17 @@ public static class WeaponSwapper
     /// never displace an already-equipped weapon. Used for container / loose-loot pickups where displacement
     /// is not appropriate — only corpse loot fires the full swap path.
     /// </summary>
-    public static async Task<Outcome> TryEquipOnlyAsync(BotOwner bot, Weapon candidate, CancellationToken ct)
+    public static async Task<Outcome> TryEquipOnlyAsync(BotOwner bot, Weapon candidate, CancellationToken ct, bool dormant = false)
     {
         if (ServerConfig.Loot.KeepSpawnWeapons) return Outcome.NotApplicable;
         if (bot == null || candidate == null) return Outcome.NotApplicable;
         var nick = bot.Profile?.Nickname ?? "(no-nick)";
         var outcome = await TryEquipIntoFirstEmptySlotAsync(bot, candidate, nick, ct);
-        if (outcome == Outcome.Swapped) await FinalizeWeaponSwapAsync(bot, nick, ct);
+        if (outcome == Outcome.Swapped)
+        {
+            if (dormant) RegisterDormantEquip(bot, candidate, nick);
+            else await FinalizeWeaponSwapAsync(bot, nick, ct);
+        }
         return outcome;
     }
 
@@ -196,7 +288,7 @@ public static class WeaponSwapper
     }
 
 
-    private static async Task<Outcome> EvaluateAndPerformAsync(BotOwner bot, Weapon candidate, Item rootSource, string nick, CancellationToken ct)
+    private static async Task<Outcome> EvaluateAndPerformAsync(BotOwner bot, Weapon candidate, Item rootSource, string nick, CancellationToken ct, bool dormant = false)
     {
         var equipment = bot.GetPlayer.Inventory.Equipment;
         var primary1Slot = equipment.GetSlot(EquipmentSlot.FirstPrimaryWeapon);
@@ -231,16 +323,21 @@ public static class WeaponSwapper
         }
 
         return !candidateFitsPrimary && candidateFitsHolster
-            ? await HandleHolsterCandidateAsync(bot, candidate, holsterSlot, inventoryItems, weights, margin, candidateScore, rootSource, nick, ct)
-            : await HandlePrimaryCandidateAsync(bot, candidate, primary1Slot, primary2Slot, inventoryItems, weights, margin, candidateScore, rootSource, nick, ct);
+            ? await HandleHolsterCandidateAsync(bot, candidate, holsterSlot, inventoryItems, weights, margin, candidateScore, rootSource, nick, ct, dormant)
+            : await HandlePrimaryCandidateAsync(bot, candidate, primary1Slot, primary2Slot, inventoryItems, weights, margin, candidateScore, rootSource, nick, ct, dormant);
     }
 
     private static async Task<Outcome> HandleHolsterCandidateAsync(
         BotOwner bot, Weapon candidate, Slot holsterSlot,
         List<Item> inventoryItems, WeaponWeights weights, float margin,
-        float candidateScore, Item rootSource, string nick, CancellationToken ct)
+        float candidateScore, Item rootSource, string nick, CancellationToken ct, bool dormant = false)
     {
         var current = holsterSlot.ContainedItem as Weapon;
+        if (dormant && current != null && IsInHands(bot, current))
+        {
+            Log.Debug($"WeaponSwap({nick}): ghost keeps its holster weapon, it is the one in hands and a sleeper's hands cannot be touched");
+            return Outcome.Skipped;
+        }
         if (current == null)
         {
             Log.Info($"WeaponSwap({nick}): holster empty — equip {candidate.LocalizedName()} (score {candidateScore:F1})");
@@ -266,10 +363,17 @@ public static class WeaponSwapper
     private static async Task<Outcome> HandlePrimaryCandidateAsync(
         BotOwner bot, Weapon candidate, Slot primary1Slot, Slot primary2Slot,
         List<Item> inventoryItems, WeaponWeights weights, float margin,
-        float candidateScore, Item rootSource, string nick, CancellationToken ct)
+        float candidateScore, Item rootSource, string nick, CancellationToken ct, bool dormant = false)
     {
         var current1 = primary1Slot?.ContainedItem as Weapon;
         var current2 = primary2Slot?.ContainedItem as Weapon;
+        // Ghost: every branch below only ever displaces primary2 (primary1 is promoted through a slot swap), so
+        // the single hands-affecting case to refuse is a sleeper holding its SECOND primary.
+        if (dormant && current2 != null && IsInHands(bot, current2))
+        {
+            Log.Debug($"WeaponSwap({nick}): ghost holds its second primary in hands, no swap while asleep");
+            return Outcome.Skipped;
+        }
 
         // Primary1 empty: direct equip.
         if (current1 == null)
@@ -291,6 +395,11 @@ public static class WeaponSwapper
             {
                 Log.Info($"WeaponSwap({nick}): promote candidate {candidate.LocalizedName()}({candidateScore:F1}) → primary1 (via temp slot2 + atomic swap, demote {current1.LocalizedName()}({score1:F1}))");
                 if (!await MoveIntoSlotAsync(bot, candidate, primary2Slot, nick, ct)) return Outcome.Skipped;
+                if (dormant)
+                {
+                    RegisterPendingPromotion(bot, candidate, nick);
+                    return Outcome.Swapped;
+                }
                 if (!await SwapInPlaceAsync(bot, candidate, current1, nick, ct))
                 {
                     Log.Info($"WeaponSwap({nick}): atomic swap fallback — candidate stays as secondary, primary1 unchanged");
@@ -318,6 +427,11 @@ public static class WeaponSwapper
             // demoted current1 (PRI2); current2 is gone, taking any un-stripped mods with it.
             await StripValuableModsBeforeDiscardAsync(bot, current2, new[] { candidate, current1 }, nick, ct);
             if (!await SwapInPlaceAsync(bot, candidate, current2, nick, ct)) return Outcome.Skipped;
+            if (dormant)
+            {
+                RegisterPendingPromotion(bot, candidate, nick);
+                return Outcome.Swapped;
+            }
             SyncBotBetweenSwaps(bot, nick);
             await WaitForIsChangingWeaponAsync(bot, nick, ct);
             if (!await SwapInPlaceAsync(bot, candidate, current1, nick, ct))
@@ -379,9 +493,12 @@ public static class WeaponSwapper
             if (!result.Succeed)
             {
                 Log.Warning($"WeaponSwap.{label}({nick}): tx FAILED — {result.Error}");
+                if (result.Error == "Can not execute")
+                    Log.Warning($"WeaponSwap.{label}({nick}): refusal detail: {DescribeRefusal(bot, op.Value)}");
                 return false;
             }
             Log.Debug($"WeaponSwap.{label}({nick}): tx DONE (succeeded), settling {PostTransactionSettleMs}ms");
+            bot.GetPlayer?.gameObject?.GetComponent<OrbitLootHandler>()?.ReportInventoryProgress(ct);
             await Task.Delay(PostTransactionSettleMs, ct);
             return true;
         }
@@ -398,6 +515,38 @@ public static class WeaponSwapper
     /// cref="ItemManipulator.Swap"/>, the same op the vanilla UI dispatches when dragging an item
     /// onto an already-occupied slot. Neither slot is transiently empty during the exchange.
     /// </summary>
+    /// <summary>
+    /// Dry run of <see cref="SwapInPlaceAsync"/>: builds the same simulated operation and throws it away. The
+    /// rig and backpack swappers move the bot's carry INTO the candidate before swapping, so a swap BSG refuses
+    /// must be known before anything is moved. Customs raid, AlienShooter: a TV-110 armored rig could not go to
+    /// a corpse that wore an armor vest (BSG slot conflict), the build failed AFTER the magazines had been
+    /// moved into the corpse's rig, and the bot walked away without them.
+    /// </summary>
+    internal static bool CanSwapInPlace(BotOwner bot, Item itemA, Item itemB, out string error)
+    {
+        error = null;
+        try
+        {
+            var ic = bot.GetPlayer?.InventoryController;
+            var addrA = itemA?.CurrentAddress;
+            var addrB = itemB?.CurrentAddress;
+            if (ic == null || addrA == null || addrB == null)
+            {
+                error = "missing inventory controller or item address";
+                return false;
+            }
+            var op = ItemManipulator.Swap(itemA, addrB, itemB, addrA, ic, true);
+            if (op.Succeeded) return true;
+            error = op.Error?.ToString() ?? "refused";
+            return false;
+        }
+        catch (System.Exception e)
+        {
+            error = e.Message;
+            return false;
+        }
+    }
+
     internal static async Task<bool> SwapInPlaceAsync(BotOwner bot, Item itemA, Item itemB, string nick, CancellationToken ct)
     {
         var ic = bot.GetPlayer?.InventoryController;
@@ -418,6 +567,96 @@ public static class WeaponSwapper
             return false;
         }
         return await RunGuardedTransactionAsync(bot, op, $"Swap({itemA.LocalizedName()}@{descA} ↔ {itemB.LocalizedName()}@{descB})", nick, ct);
+    }
+
+    /// <summary>Dry run of <see cref="MoveIntoSlotAsync"/>: same simulated operation, thrown away.</summary>
+    internal static bool CanMoveIntoSlot(BotOwner bot, Item item, Slot slot, out string error)
+    {
+        error = null;
+        try
+        {
+            var ic = bot.GetPlayer?.InventoryController;
+            if (ic == null || item == null || slot == null)
+            {
+                error = "missing inventory controller, item or slot";
+                return false;
+            }
+            var op = ItemManipulator.Move(item, slot.CreateItemAddress(), ic, true);
+            if (op.Succeeded) return true;
+            error = op.Error?.ToString() ?? "refused";
+            return false;
+        }
+        catch (System.Exception e)
+        {
+            error = e.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Dry run of the equip a gear swapper is about to do: the move into an empty slot, or the positional swap
+    /// with what the slot holds. Null when BSG accepts it, its reason otherwise. Slot.CheckCompatibility only
+    /// looks at the slot filter; the refusals caught here are the cross-slot ones it cannot see: a helmet that
+    /// blocks the Earpiece slot, a headset and a hat that conflict with each other (on the bot, or on the
+    /// corpse that would receive the displaced item), an armor vest against an armored rig.
+    /// </summary>
+    internal static string EquipRefusal(BotOwner bot, Item candidate, Slot slot)
+    {
+        string error;
+        var current = slot?.ContainedItem;
+        var accepted = current == null
+            ? CanMoveIntoSlot(bot, candidate, slot, out error)
+            : CanSwapInPlace(bot, candidate, current, out error);
+        if (accepted) return null;
+        // BSG names every item with its 24-character id, which triples the length of the message.
+        return System.Text.RegularExpressions.Regex.Replace(error ?? "refused", @" \(id: [0-9a-f]{24}\)", string.Empty);
+    }
+
+    /// <summary>
+    /// What stands behind BSG's bare "Can not execute". ItemController.TryRunNetworkTransaction answers it when
+    /// the operation's CanExecute fails, which for a move is Item.CheckAction(To): the inventory is blocked, or
+    /// the item, its target container or the target cells are held by an operation still registered as ACTIVE
+    /// on one of the two owners (ItemController.CheckItemAction). An operation stays active until its hands
+    /// animation ends, which never happens on a body that fell asleep in the middle of it. Log-only.
+    /// </summary>
+    internal static string DescribeRefusal(BotOwner bot, object operation)
+    {
+        try
+        {
+            var ic = bot?.GetPlayer?.InventoryController;
+            if (ic == null) return "no inventory controller";
+            var sb = new System.Text.StringBuilder();
+            sb.Append(operation?.GetType().Name ?? "?");
+            IItemOwner sourceOwner = null;
+            if (operation is MoveResult move && move._item != null)
+            {
+                var to = move._to;
+                sb.Append($" {move._item.LocalizedName()} {DescribeAddress(move._item.CurrentAddress, bot)} -> {DescribeAddress(to, bot)} in {to?.Container?.ParentItem?.LocalizedName() ?? "?"} [{to}]");
+                var check = move._item.CheckAction(to);
+                sb.Append(check.Failed ? $", CheckAction: {check.Error?.GetType().Name} {check.Error}" : ", CheckAction passes now");
+                sourceOwner = move._item.Parent?.GetOwner();
+            }
+            sb.Append($", inventory blocked: {ic.IsInventoryBlocked()}");
+            sb.Append($", hands: {bot.GetPlayer.HandsController?.GetType().Name ?? "none"} holding {bot.GetPlayer.HandsController?.Item?.LocalizedName() ?? "nothing"}");
+            AppendActiveEvents(sb, "bot", ic, bot);
+            if (sourceOwner != null && !ReferenceEquals(sourceOwner, ic)) AppendActiveEvents(sb, "source", sourceOwner, bot);
+            return sb.ToString();
+        }
+        catch (System.Exception e)
+        {
+            return $"refusal diagnostic threw: {e.Message}";
+        }
+    }
+
+    private static void AppendActiveEvents(System.Text.StringBuilder sb, string label, IItemOwner owner, BotOwner bot)
+    {
+        var events = owner.SelectEvents((Item)null).ToList();
+        sb.Append($", active operations on {label}: {events.Count}");
+        for (var i = 0; i < events.Count && i < 6; i++)
+        {
+            var e = events[i];
+            sb.Append($" | {e.GetType().Name} {e.Item?.LocalizedName() ?? "?"} ({e.Status}) at {DescribeAddress(e.Location, bot)} [{e.Location}]");
+        }
     }
 
     internal static async Task<bool> MoveIntoSlotAsync(BotOwner bot, Item item, Slot slot, string nick, CancellationToken ct)

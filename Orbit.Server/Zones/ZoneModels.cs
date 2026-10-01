@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Orbit.Zones;
 
 namespace Orbit.Server.Zones;
 
@@ -18,7 +19,7 @@ public class ZoneVec
     [JsonPropertyName("y")] public float Y { get; set; }
 }
 
-public class BuiltinZoneModel
+public class BuiltinZoneModel : ZoneScope
 {
     public ZoneRange Radius { get; set; } = new() { Min = 1f, Max = 1f };
     public ZoneRange Force { get; set; } = new() { Min = 1f, Max = 1f };
@@ -27,8 +28,12 @@ public class BuiltinZoneModel
     public bool KillMains { get; set; } = true;
 }
 
-public class CustomZoneModel
+public class CustomZoneModel : ZoneScope
 {
+    // Editor-only label. Omitted from the JSON when unset, and ignored by the client (Newtonsoft skips
+    // members it does not know), so files stay readable by every ORBIT version.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
     public ZoneVec Position { get; set; } = new();
     public ZoneRange Radius { get; set; } = new() { Min = 100f, Max = 150f };
     public ZoneRange Force { get; set; } = new() { Min = 0.5f, Max = 1f };
@@ -45,6 +50,8 @@ public class ConvergenceModel
 
 public class MapZoneModel
 {
+    // Missing in older files. Native-floor migration runs on load, import and save.
+    public int SchemaVersion { get; set; }
     public Dictionary<string, BuiltinZoneModel> BuiltinZones { get; set; } = new();
     public List<CustomZoneModel> CustomZones { get; set; } = new();
     // Null = "use the client's compiled-in default for this map" (pre-restore files) — preserved as-is.

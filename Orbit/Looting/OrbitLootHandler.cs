@@ -16,7 +16,7 @@ using UnityEngine;
 
 namespace Orbit.Looting;
 
-public class OrbitLootHandler : MonoBehaviour, ILootHandler
+public partial class OrbitLootHandler : MonoBehaviour, ILootHandler
 {
     // Fallback per-slot threshold for bots without an archetype-resolved value (PlayerScavs, or PMCs while
     // SAIN attach is pending).
@@ -71,6 +71,15 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void BumpLootActivity() => _lastLootActivityTime = Time.realtimeSinceStartup;
+
+    internal void ReportInventoryProgress(CancellationToken sessionToken)
+    {
+        // Equipment swaps can transfer many items before returning to the main loot loop.
+        // Only successful work for the current, still-running session resets its watchdog.
+        if (!LootTaskRunning || _cts == null || sessionToken != _cts.Token || sessionToken.IsCancellationRequested)
+            return;
+        BumpLootActivity();
+    }
 
     // Current loot source root (corpse equipment / container fixture / loose item). Set per LootXxxAsync
     // entry; used by the swap evaluator to size the candidate's reachable ammo pool.
@@ -191,6 +200,15 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
         }
         try
         {
+            // A better weapon parked in primary2 while the bot slept is promoted here, at the start of any
+            // awake session: the bot is pinned and calm. Hooking it on phase 4 missed every session that ends
+            // early with nothing to take, which is most of them (Shoreline raid: a parked Benelli went through
+            // an awake container session without ever being promoted).
+            if (!DormantMode)
+            {
+                using var body = _bodyGate.Enter(true);
+                await WeaponSwapper.PromotePendingAsync(_bot, ct);
+            }
             switch (kind)
             {
                 case LootKind.Container:
@@ -281,8 +299,13 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
     {
         try
         {
-            if (_bot == null) return;
-            try { _bot.PatrollingData?.Unpause(); } catch (System.Exception e) { Log.Warning($"OrbitLootHandler.UnfreezeBotAfterLootSession({Nick}): PatrollingData.Unpause THREW {e.Message}"); }
+            if (_bot == null || _bot.IsDead || DormantMode) return;
+            var agent = Singleton<BotRoster>.Instance?.GetAgent(_bot);
+            // Cancellation can finish after combat or Ghost has taken ownership of the body.
+            // The layer handoff already released our mover pause; leave the new owner's state alone.
+            if (agent == null || !agent.IsActive || agent.IsDormant) return;
+            if (_bot.Memory != null && (_bot.Memory.HaveEnemy || _bot.Memory.IsUnderFire)) return;
+            try { Orbit.Patches.LootPatrolResumePatch.Resume(_bot); } catch (System.Exception e) { Log.Warning($"OrbitLootHandler.UnfreezeBotAfterLootSession({Nick}): PatrollingData.Unpause THREW {e.Message}"); }
             try { if (_bot.Mover != null) _bot.Mover.Pause = false; } catch (System.Exception e) { Log.Warning($"OrbitLootHandler.UnfreezeBotAfterLootSession({Nick}): Mover.Pause THREW {e.Message}"); }
             try { _bot.SetPose(1f); } catch (System.Exception e) { Log.Warning($"OrbitLootHandler.UnfreezeBotAfterLootSession({Nick}): SetPose THREW {e.Message}"); }
             Log.Debug($"OrbitLootHandler.UnfreezeBotAfterLootSession({Nick}): bot movement resumed + standing + patrol data resumed");
@@ -322,6 +345,7 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
 
         if (container.DoorState != EDoorState.Open)
         {
+            using var body = _bodyGate.Enter(!DormantMode);
             if (!DormantMode)
             {
                 Log.Debug($"OrbitLootHandler.Container({Nick}, {container.name}): Interact(Open), waiting {ContainerOpenAnimMs}ms anim");
@@ -346,7 +370,13 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
         try
         {
             Log.Debug($"OrbitLootHandler.Container({Nick}, {container.name}): calling LootOpener.Interact(Close), door={container.DoorState}");
-            _bot.LootOpener.Interact(container, EInteractionType.Close);
+            if (!DormantMode) _bot.LootOpener.Interact(container, EInteractionType.Close);
+            else if (container.DoorState == EDoorState.Open)
+            {
+                if (FikaDetection.FikaLoaded)
+                    _bot.GetPlayer.ExecuteInteraction(container, new InteractionResult(EInteractionType.Close));
+                else container.Close();
+            }
         }
         catch (System.Exception e)
         {
@@ -537,9 +567,9 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
             }
         }
 
-        // Dormant fast path: pickups only — equips/swaps mutate BSG weapon/hands state, which must not
-        // run on a disabled body. The value is already banked by the transfers above.
-        if (DormantMode) return;
+        // A sleeper equips too. Every gear equip below is an inventory transaction, the same kind the ghost
+        // pickups above already run on an inactive body. Only the weapon path touches the hands, and the
+        // swapper's dormant variant leaves them alone (hands resync at wake, see WeaponSwapper).
 
         // Phase 4: perform up to four equips in sequence (weapon → armor → helmet → rig), each preceded by a
         // settle so the bot's BSG-side state is quiescent before the next op. These are the last BSG ops of
@@ -875,8 +905,8 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
             }
         }
 
-        // Dormant fast path: no swaps/equips on a disabled body — the drained value is already banked.
-        if (DormantMode) return;
+        // A sleeper swaps too: gear swaps are plain inventory transactions, and the weapon swapper's dormant
+        // variant never moves the weapon in hands (promotion and redraw are deferred, see WeaponSwapper).
 
         // Phase 4: perform the single best swap — last BSG-affecting op of the session.
         if (best != null)
@@ -895,7 +925,14 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
                 Log.Info($"OrbitLootHandler.Corpse({Nick}, {corpse.name}): phase4 SKIP {best.Value.sourcePath} → {best.Value.weapon.LocalizedName()} — no longer beats updated loadout");
                 return;
             }
-            if (recheck.DisplacedWeapon != null)
+            if (DormantMode && recheck.DisplacedWeapon != null && WeaponSwapper.IsInHands(_bot, recheck.DisplacedWeapon))
+            {
+                // Checked BEFORE the pre-strip: the dormant swapper would refuse this swap, and stripping the
+                // mods off a weapon the bot then keeps would only damage its own gun.
+                Log.Info($"OrbitLootHandler.Corpse({Nick}, {corpse.name}): phase4 SKIP weapon swap, the weapon it would displace is in the sleeper's hands");
+                recheck = WeaponSwapper.WouldSwapResult.No;
+            }
+            if (recheck.WouldSwap && recheck.DisplacedWeapon != null)
             {
                 Log.Debug($"OrbitLootHandler.Corpse({Nick}, {corpse.name}): phase4 pre-strip mods of {recheck.DisplacedWeapon.LocalizedName()} (will be thrown to corpse by swap)");
                 var displacedModItems = new List<DrainEntry>();
@@ -908,10 +945,13 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
                     await TransferItemAsync(modEntry, ct);
                 }
             }
-            Log.Info($"OrbitLootHandler.Corpse({Nick}, {corpse.name}): phase4 perform weapon swap — candidate {best.Value.weapon.LocalizedName()} (from corpse {best.Value.sourcePath}); destination decided by WeaponSwapper");
-            _allowWeaponSwapPath = true;
-            try { await TransferItemAsync(new DrainEntry(best.Value.weapon, best.Value.sourcePath), ct); }
-            finally { _allowWeaponSwapPath = false; }
+            if (recheck.WouldSwap)
+            {
+                Log.Info($"OrbitLootHandler.Corpse({Nick}, {corpse.name}): phase4 perform weapon swap — candidate {best.Value.weapon.LocalizedName()} (from corpse {best.Value.sourcePath}); destination decided by WeaponSwapper");
+                _allowWeaponSwapPath = true;
+                try { await TransferItemAsync(new DrainEntry(best.Value.weapon, best.Value.sourcePath), ct); }
+                finally { _allowWeaponSwapPath = false; }
+            }
         }
 
         // Phase 4b: body armor swap. Independent of the weapon swap; if both fired, the bot's inventory
@@ -1114,15 +1154,18 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
         // bot's bag instead of being left behind.
         if (entry.Item is Weapon candidateWeapon)
         {
+            using var body = _bodyGate.Enter(!DormantMode);
             WeaponSwapper.Outcome outcome;
             if (_allowWeaponSwapPath)
             {
-                outcome = await WeaponSwapper.TryHandleAsync(_bot, candidateWeapon, _currentSourceRoot, ct);
+                outcome = await WeaponSwapper.TryHandleAsync(_bot, candidateWeapon, _currentSourceRoot, ct, DormantMode);
             }
             else if (DormantMode)
             {
-                // Dormant: never equip — bag the weapon via the default placement below.
-                outcome = WeaponSwapper.Outcome.NotApplicable;
+                // Dormant: an empty weapon slot can be filled without touching the hands; otherwise the weapon
+                // goes to the bag through the default placement below.
+                outcome = await WeaponSwapper.TryEquipOnlyAsync(_bot, candidateWeapon, ct, dormant: true);
+                if (outcome == WeaponSwapper.Outcome.Skipped) outcome = WeaponSwapper.Outcome.NotApplicable;
             }
             else
             {
@@ -1267,6 +1310,7 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
             return taken;
         }
 
+        using var body = _bodyGate.Enter(true);
         var pickupReady = new TaskCompletionSource<bool>();
         try
         {
@@ -1362,6 +1406,14 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
         return !profile.WillBeAPlayerScav();
     }
 
+    internal bool HasSpaceForLooseLoot(LootItem loot)
+    {
+        var inventory = _bot.GetPlayer?.InventoryController;
+        return inventory != null && loot?.Item != null
+            && ItemManipulator.QuickFindAppropriatePlace(loot.Item, inventory,
+                new[] { inventory.Inventory.Equipment }, ItemManipulator.EMoveItemOrder.PickUp, true).Succeeded;
+    }
+
     private OperationResult<IItemOperationResult> FindPlace(DrainEntry entry, InventoryController inventoryController, string name, float price)
     {
         var targets = new[] { inventoryController.Inventory.Equipment };
@@ -1381,6 +1433,8 @@ public class OrbitLootHandler : MonoBehaviour, ILootHandler
         {
             var result = await inventoryController.TryRunNetworkTransaction(place, null);
             if (!result.Succeed) Log.Warning($"OrbitLootHandler.Pickup({Nick}): TX FAILED on {name} (Error={result.Error})");
+            if (!result.Succeed && result.Error == "Can not execute")
+                Log.Warning($"OrbitLootHandler.Pickup({Nick}): refusal detail: {WeaponSwapper.DescribeRefusal(_bot, place.Value)}");
             return result.Succeed;
         }
         catch (System.OperationCanceledException) { throw; }

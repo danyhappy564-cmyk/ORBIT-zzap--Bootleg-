@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Orbit.Server</AssemblyName>
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <RootNamespace>Orbit.Server</RootNamespace>
     <!-- SPT 4.1 server root (DLL references + deploy target) -->
     <SPT_DIR Condition=" '$(SPT_DIR)' == '' ">C:\Games\SPT-4.1\SPT_Runtime</SPT_DIR>
@@ -17,7 +17,7 @@
 
   <ItemGroup>
     <!-- Per-map zone defaults, seeded from the client's compiled-in defaults (Config/Maps/Zones). -->
-    <EmbeddedResource Include="Resources\Zones\*.json" />
+    <EmbeddedResource Include="Resources\Zones\*.json" LogicalName="Orbit.Server.Resources.Zones.%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>
@@ -27,6 +27,10 @@
     <Reference Include="SPTarkov.Common"><HintPath>$(SPT_DIR)\SPTarkov.Common.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="SemanticVersioning"><HintPath>$(SPT_DIR)\SemanticVersioning.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="MudBlazor"><HintPath>$(SPT_DIR)\MudBlazor.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" Link="Zones\%(Filename)%(Extension)" />
   </ItemGroup>
 
   <Target Name="EnsureSptDir" BeforeTargets="Build">

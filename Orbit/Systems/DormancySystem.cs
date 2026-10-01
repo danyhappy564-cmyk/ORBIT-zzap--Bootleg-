@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using Comfort.Common;
 using EFT;
 using EFT.CameraControl;
@@ -7,6 +8,7 @@ using Orbit.Core;
 using Orbit.Entities;
 using Orbit.Helpers;
 using Orbit.Looting;
+using Orbit.Navigation;
 using Orbit.Sain;
 using UnityEngine;
 
@@ -27,8 +29,8 @@ namespace Orbit.Systems;
 /// ORBIT squads sleep atomically, polled at 2 Hz, with TWO kinds of hysteresis learned from the test
 /// raids:
 ///  - spatial: sleep beyond SleepDistance from every human, wake within WakeDistance;
-///  - temporal: a woken squad stays awake at least WakeCooldownSeconds (so SAIN gets a real window to
-///    heal or fight — without it a bleeding sleeper looped wake/sleep every bleed tick and bled out),
+///  - temporal: wake reasons set a short transition delay or a full recovery window for damage,
+///    targeting, real fights and native fallbacks; independent health/combat checks still apply,
 ///    and a freshly-slept squad ignores the awake-bot trigger for SleepGraceSeconds (kills the 2 Hz
 ///    ping-pong pairs without muting encounter wakes: an active bot crossing a dormant squad MUST wake
 ///    it, that is where scav kills come from).
@@ -36,19 +38,26 @@ namespace Orbit.Systems;
 /// Sleep POLICY is per bot TYPE, orthogonal to who drives the bot: every type except PMC and PlayerScav
 /// has a "default dormant" toggle (scavs, Goons, bosses+followers, cultists, raiders/rogues, bloodhounds,
 /// others — all ON by default). A toggled type sleeps from a tight ring and never takes a population-floor
-/// slot; ORBIT-driven members ghost-walk their routes while dormant, vanilla members freeze in place (per
+/// slot; ORBIT-driven members ghost-walk their routes while supported native members follow their own paths (per
 /// BSG BotsGroup, so a boss never sleeps apart from its followers). Toggle OFF = ORBIT bots of that type
 /// fall back to the standard PMC-like rules, vanilla bots of that type are left untouched. The floor only
 /// counts standard-policy bots and self-caps to half of them, so small-population maps still sleep. Bots
 /// whose HP dropped recently never sleep (bleeds tick on inactive bodies and a sleeper cannot heal).
 /// Corpses can never go dormant, and OnAgentRemoved re-activates a dormant body just in case.
 /// </summary>
-public class DormancySystem
+public partial class DormancySystem
 {
     private const float PollIntervalSeconds = 0.5f;
-    private const float WakeCooldownSeconds = 30f;
+    // Extract-bound squads keep ghosting toward the exfil and only wake this close to it: the
+    // walk stays free, only the trigger interaction runs on the real AI.
+    private const float ExtractWakeDistance = 50f;
+    private const float ExtractWakeDistanceSqr = ExtractWakeDistance * ExtractWakeDistance;
     private const float SleepGraceSeconds = 15f;
     private const float HpStableSeconds = 15f;
+    // A far, out-of-combat bot whose HP keeps dropping gets a simulated patch-up at most this often.
+    private const float GhostPatchUpCooldownSeconds = 30f;
+    // Dormant bots' brain tick (BigBrain layer sweep + active action) runs on one frame out of this many.
+    public const int DormantBrainTickDivisor = 6;
 
     // Ghost skirmishes: a hostile DORMANT unit detects another when it comes inside its REACH: a base
     // engagement range scaled by the best optic magnification among its members (a sniper ghost spots
@@ -91,17 +100,52 @@ public class DormancySystem
     /// a sleeper. Read + reset by the 30s summary line — proves the vision shield actually fires.</summary>
     public static long VisionBlocks;
 
+    /// <summary>Brain agents (AICoreAgent) of dormant bots, consulted by DormantBrainThrottlePatch on
+    /// every brain tick. Static because the patch is static; there is one dormancy system per raid.</summary>
+    private static readonly HashSet<object> _throttledBrainAgents = new();
+
+    /// <summary>Brain ticks skipped on dormant bots since the last summary line.</summary>
+    public static long BrainTicksSkipped;
+
+    /// <summary>True when this brain tick belongs to a dormant bot and lands on a skipped frame. Ticks are
+    /// staggered per agent so the ones that do run spread across frames instead of bunching up.</summary>
+    public static bool ShouldSkipBrainTick(object agent)
+    {
+        if (agent == null || _throttledBrainAgents.Count == 0 || !_throttledBrainAgents.Contains(agent)) return false;
+        var phase = (RuntimeHelpers.GetHashCode(agent) & 0x7fffffff) % DormantBrainTickDivisor;
+        if ((Time.frameCount + phase) % DormantBrainTickDivisor == 0) return false;
+        BrainTicksSkipped++;
+        return true;
+    }
+
+    private static void ThrottleBrain(BotOwner bot)
+    {
+        var agent = bot?.Brain?.Agent;
+        if (agent != null) _throttledBrainAgents.Add(agent);
+    }
+
+    private static void UnthrottleBrain(BotOwner bot)
+    {
+        var agent = bot?.Brain?.Agent;
+        if (agent != null) _throttledBrainAgents.Remove(agent);
+    }
+
     public static void ClearStatics()
     {
+        NativeGhostSystem.Clear();
+        BotLandingGuard.Clear();
         Api.OrbitTelemetry.ClearGhostFights();
         DormantProfileIds.Clear();
+        _throttledBrainAgents.Clear();
         GhostMovementEnabled = false;
         VisionBlocks = 0;
+        BrainTicksSkipped = 0;
     }
 
     private readonly MovementSystem _movementSystem;
     private readonly DoorSystem _doorSystem;
     private readonly BotRoster _botRoster;
+    private readonly NativeGhostSystem _nativeGhosts;
     private readonly GameWorld _gameWorld;
     private readonly TimePacing _pollPacing = new(PollIntervalSeconds);
 
@@ -124,18 +168,19 @@ public class DormancySystem
     private readonly List<Agent> _dormantAgents = new();
     // Poll scratch buffers, reused to stay allocation-free at 2 Hz.
     private readonly List<Vector3> _humanPositions = new();
-    private readonly HashSet<string> _targetedProfileIds = new();
+    private readonly Dictionary<string, Player> _targetedBy = new();
     private readonly List<Squad> _sleepCandidates = new();
     private readonly List<Squad> _wakeQueue = new();
-    private readonly List<string> _wakeReasons = new();
+    private readonly List<GhostWakeReason> _wakeReasons = new();
 
     // Vanilla (non-ORBIT) sleeper state, keyed per bot. Groups are evaluated per BSG BotsGroup so a boss
     // and its followers sleep and wake together.
     private readonly HashSet<BotOwner> _vanillaDormant = new();
+    private readonly List<BotOwner> _nativeMoveScratch = new();
     private readonly Dictionary<BotOwner, float> _vanillaHpBaseline = new();
     private readonly Dictionary<BotOwner, float> _vanillaLastHp = new();
     private readonly Dictionary<BotOwner, float> _vanillaHpDropAt = new();
-    private readonly Dictionary<object, float> _vanillaGroupWokeAt = new();
+    private readonly Dictionary<object, float> _vanillaSleepAllowedAt = new();
     private readonly Dictionary<object, float> _vanillaGroupSleptAt = new();
     private readonly Dictionary<object, List<BotOwner>> _vanillaGroups = new();
 
@@ -158,6 +203,10 @@ public class DormancySystem
 
     // Weapon effective-kill-range cache per player (skirmish casualties). Same 60s TTL rationale.
     private readonly Dictionary<Player, (float range, float at)> _killRangeCache = new();
+    // Night vision cache per bot (skirmish reach and fight odds at night). Same 60s TTL rationale.
+    private readonly Dictionary<BotOwner, (bool has, float at)> _nightVisionCache = new();
+    // Darkness of the current skirmish poll, 0 (day / lit interior) to 1 (full night).
+    private float _darkness;
 
     // Simulated-fight gunfire: shots queued at resolution time and played over the following seconds
     // through BetterAudio's own sources (the fighters' bodies stay inactive — we only read their
@@ -167,6 +216,9 @@ public class DormancySystem
         public float At;
         public Vector3 Pos;
         public WeaponSoundPlayer Sound;
+        public int Rounds;            // rounds of this trigger pull (automatic weapons loop their Body clip)
+        public bool IsTail;           // end of an automatic pull: cut the loop, play the Tail bank
+        public BetterSource LoopSource;
     }
 
     private readonly List<PendingShot> _pendingShots = new();
@@ -200,7 +252,9 @@ public class DormancySystem
         public string Label;
         public bool IsSavage;
         public float Reach;
+        public float SniperReach; // horizontal detection only; ordinary combat reach stays unchanged
         public float KillRange; // best member weapon's effective kill distance (bEffDist, buckshot capped)
+        public bool NightCapable; // at least one member sees in the dark (NVG, thermal goggles, thermal / NV scope)
         public Squad Squad;          // ORBIT units
         public object VanillaKey;    // vanilla units
         public readonly List<Agent> Agents = new();        // ORBIT members (empty for vanilla units)
@@ -215,7 +269,10 @@ public class DormancySystem
     private int _windowSleeps, _windowWakes;
     private int _wakeByHuman, _wakeByAwakeBot, _wakeByExtract, _wakeByTargeted, _wakeByDamage, _wakeByScope;
     private int _farBlockedCombat, _farBlockedLoot, _farBlockedDoor, _farBlockedExtract, _farBlockedState;
-    private int _farBlockedBleeding, _farBlockedCooldown;
+    private int _farBlockedBleeding, _farBlockedCooldown, _farBlockedHealing, _farBlockedHands;
+    private int _windowPatchUps;
+    private int _windowShotsDropped;
+    private readonly Dictionary<BotOwner, float> _vanillaPatchUpAt = new();
     private int _blockedProximity, _blockedFloor;
     private int _windowFights;
     private int _windowShotsPlayed;
@@ -233,6 +290,7 @@ public class DormancySystem
         // Config is read once per raid: ServerConfig is re-fetched in OrbitInitPatch right before this
         // system is constructed, so a web-UI Save applies on the next raid, and values never move mid-raid.
         var cfg = ServerConfig.GhostMode;
+        _nativeGhosts = new NativeGhostSystem(doorSystem, MinSqrDistanceToHumans, cfg.WakeDistance);
         _cfg = cfg;
         _enabled = cfg.Enabled;
         _fightsMode = (cfg.GhostFightsMode ?? "simulated").ToLowerInvariant() switch
@@ -248,6 +306,22 @@ public class DormancySystem
         _contactChanceMul = freq == "rare" ? 0.6f : freq == "frequent" ? 1.5f : 1f;
         _lethality = Mathf.Clamp(cfg.GhostFightLethality, 0.5f, 2f);
         _scopedWakeEnabled = cfg.ScopedWake;
+        _hearingEnabled = cfg.Enabled && cfg.GhostHearing;
+        _hearingVeryAggressive = Mathf.Clamp(cfg.GhostHearingVeryAggressivePct, 0, 100) / 100f;
+        _hearingAggressive = Mathf.Clamp(cfg.GhostHearingAggressivePct, 0, 100) / 100f;
+        _hearingAverage = Mathf.Clamp(cfg.GhostHearingAveragePct, 0, 100) / 100f;
+        _hearingCautious = Mathf.Clamp(cfg.GhostHearingCautiousPct, 0, 100) / 100f;
+        _hearingTimmy = Mathf.Clamp(cfg.GhostHearingTimmyPct, 0, 100) / 100f;
+        _hearingPlayerScav = Mathf.Clamp(cfg.GhostHearingPlayerScavPct, 0, 100) / 100f;
+        if (_hearingEnabled)
+        {
+            Log.Always($"Ghost hearing chances: veryAggressive={_hearingVeryAggressive:P0} aggressive={_hearingAggressive:P0} average={_hearingAverage:P0} cautious={_hearingCautious:P0} timmy={_hearingTimmy:P0} playerScav={_hearingPlayerScav:P0}");
+            var players = HearingRanges(GhostHearingCategory.Pmc);
+            var vanilla = HearingRanges(GhostHearingCategory.Scav);
+            var factions = HearingRanges(GhostHearingCategory.Isb);
+            Log.Always($"Ghost hearing ranges: players={players.Loud:F0}/{players.Suppressed:F0}m vanilla={vanilla.Loud:F0}/{vanilla.Suppressed:F0}m factions={factions.Loud:F0}/{factions.Suppressed:F0}m (unsuppressed/suppressed)");
+            Log.Always($"Ghost hearing rules: minShots={NoiseMinRealShots} cooldown={NoiseReactionCooldownSeconds:F0}s memory={NoiseLingerSeconds:F0}s cluster={NoiseClusterRadius:F0}m");
+        }
         _scopedWakeMax = Mathf.Clamp(cfg.ScopedWakeMaxDistance, 100f, 1500f);
         // FullSleep (default): no population floor — far from every human, the whole map may sleep.
         _minAwakeBots = cfg.FullSleep ? 0 : Mathf.Max(0, cfg.MinAwakeBots);
@@ -265,6 +339,9 @@ public class DormancySystem
         _summaryWindowStart = Time.time;
 
         if (_enabled)
+            Log.Always($"Ghost encounters: mode={(string.Equals(cfg.GhostAwakeBehavior, "wake_ghost", System.StringComparison.OrdinalIgnoreCase) ? "wake_ghost" : "sleep_awake")} doorCache=2s");
+
+        if (_enabled)
             Log.Always($"Ghost Mode ON — sleep>{sleepDist:F0}m (default-dormant>{scavSleepDist:F0}m) wake<{cfg.WakeDistance:F0}m hostileWake<{cfg.HostileWakeDistance:F0}m minAwake={_minAwakeBots} ghost={(cfg.GhostMovement ? "on" : "off")} ghostLoot={B(cfg.GhostLooting)} fights={_fightsMode.ToString().ToLowerInvariant()}/{freq} lethality={_lethality:F1}x scopedWake={(_scopedWakeEnabled ? $"{_scopedWakeMax:F0}m" : "off")} dormantTypes=[scav={B(cfg.DormantScavs)} goon={B(cfg.DormantGoons)} boss={B(cfg.DormantBosses)} cultist={B(cfg.DormantCultists)} raider={B(cfg.DormantRaiders)} bloodhound={B(cfg.DormantBloodhounds)} other={B(cfg.DormantOthers)}]");
     }
 
@@ -280,11 +357,9 @@ public class DormancySystem
         if (!role.HasValue) return false;
         var r = role.Value;
         if (r.IsPMC()) return false;
+        if (r == WildSpawnType.marksman) return _cfg.DormantScavs;
         if (r.IsScav())
             return bot.Profile != null && !bot.Profile.WillBeAPlayerScav() && _cfg.DormantScavs;
-        // Sniper scavs never sleep: they are cheap stationary overwatch, and their entire role is
-        // long-range threat — a sleeping one is just absent.
-        if (r == WildSpawnType.marksman) return false;
         if (r.IsGoon()) return _cfg.DormantGoons;
         if (r.IsCultist()) return _cfg.DormantCultists;
         if (r.IsRaider()) return _cfg.DormantRaiders;
@@ -296,8 +371,13 @@ public class DormancySystem
     public void Update(List<Agent> liveAgents, List<Squad> squads)
     {
         if (!_enabled) return;
+        // Check before scheduled shots/kills: spectators must see live combat after waking.
+        if (UpdateSpectatorMode()) return;
         if (_pendingShots.Count > 0) PumpGhostFightShots();
         if (_activeFights.Count > 0) PumpGhostFights();
+        _nativeMoveScratch.Clear();
+        _nativeMoveScratch.AddRange(_vanillaDormant);
+        for (var i = 0; i < _nativeMoveScratch.Count; i++) _nativeGhosts.Move(_nativeMoveScratch[i]);
         if (!_pollPacing.Allowed()) return;
 
         // The whole poll is crash-proofed: raid-3 test showed a single throwing access (a despawning
@@ -322,6 +402,23 @@ public class DormancySystem
         ScanWorld();
         UpdateScopeState();
 
+        if (!string.Equals(_cfg.GhostAwakeBehavior, "wake_ghost", System.StringComparison.OrdinalIgnoreCase))
+            UpdateSleepPreferred(liveAgents, squads);
+        else
+            UpdateWakePreferred(liveAgents, squads);
+
+        if (_fightsMode != GhostFightsMode.Off)
+            ResolveGhostSkirmishes(squads);
+
+        PollGhostHearing(squads);
+        HealDormantWounded();
+
+        EmitSummaryIfDue(liveAgents.Count);
+    }
+
+    private void UpdateWakePreferred(List<Agent> liveAgents, List<Squad> squads)
+    {
+        CollectVanillaGroups();
         // ── Pass 1: decide wakes, collect sleep candidates ──────────────
         _sleepCandidates.Clear();
         _wakeQueue.Clear();
@@ -337,7 +434,7 @@ public class DormancySystem
                 if (reason != null)
                 {
                     _wakeQueue.Add(squad);
-                    _wakeReasons.Add(reason);
+                    _wakeReasons.Add(reason.Value);
                 }
             }
             else
@@ -364,6 +461,7 @@ public class DormancySystem
             totalStandard++;
             if (!agent.IsDormant) awakeStandard++;
         }
+        CountNativeStandard(ref totalStandard, ref awakeStandard);
         var floor = Mathf.Min(_minAwakeBots, (totalStandard + 1) / 2);
 
         for (var i = 0; i < _sleepCandidates.Count; i++)
@@ -376,28 +474,30 @@ public class DormancySystem
             SleepSquad(squad);
             if (!defaultDormant) awakeStandard -= squad.Members.Count;
         }
+        UpdateVanilla(ref awakeStandard, floor);
         _lastAwakeStandard = awakeStandard;
 
-        UpdateVanilla();
-
-        if (_fightsMode != GhostFightsMode.Off)
-            ResolveGhostSkirmishes(squads);
-
-        HealDormantWounded();
-
-        EmitSummaryIfDue(liveAgents.Count);
     }
 
     /// <summary>Re-activates a dormant body when its agent leaves the roster (death or removal), so a
     /// corpse or despawned bot is never left as an invisible inactive GameObject.</summary>
     public void OnAgentRemoved(Agent agent)
     {
+        NativeAwakeGrenadeDiagnostics.Forget(agent.Bot);
         if (!agent.IsDormant) return;
         agent.IsDormant = false;
         _dormantAgents.Remove(agent);
         DormantProfileIds.Remove(agent.Player?.ProfileId);
-        var go = agent.Bot?.gameObject;
-        if (go != null && !go.activeSelf) go.SetActive(true);
+        UnthrottleBrain(agent.Bot);
+        try
+        {
+            var go = agent.Bot?.gameObject;
+            if (go != null && !go.activeSelf) go.SetActive(true);
+        }
+        catch
+        {
+            // The body was already destroyed (despawn), nothing left to re-activate.
+        }
         Log.Info($"{agent} removed while dormant — body re-activated");
     }
 
@@ -412,17 +512,20 @@ public class DormancySystem
         Log.Info(
             $"LIMITER: dormant={_dormantAgents.Count}/{liveAgentCount} agents +{_vanillaDormant.Count} vanilla (standardAwake={_lastAwakeStandard}) | 30s: sleeps={_windowSleeps} wakes={_windowWakes} " +
             $"[human={_wakeByHuman} awakeBot={_wakeByAwakeBot} extract={_wakeByExtract} targeted={_wakeByTargeted} damage={_wakeByDamage} scope={_wakeByScope}] " +
-            $"farBlocked=[combat={_farBlockedCombat} loot={_farBlockedLoot} door={_farBlockedDoor} extract={_farBlockedExtract} state={_farBlockedState} bleeding={_farBlockedBleeding} cooldown={_farBlockedCooldown} proximity={_blockedProximity} floor={_blockedFloor}] " +
-            $"ghostFights={_windowFights} fightShotsPlayed={_windowShotsPlayed} visionBlocks={VisionBlocks}");
+            $"farBlocked=[combat={_farBlockedCombat} loot={_farBlockedLoot} door={_farBlockedDoor} extract={_farBlockedExtract} state={_farBlockedState} bleeding={_farBlockedBleeding} healing={_farBlockedHealing} hands={_farBlockedHands} cooldown={_farBlockedCooldown} proximity={_blockedProximity} floor={_blockedFloor}] " +
+            $"ghostFights={_windowFights} fightShotsPlayed={_windowShotsPlayed} fightShotsDropped={_windowShotsDropped} visionBlocks={VisionBlocks} brainTicksSkipped={BrainTicksSkipped} patchUps={_windowPatchUps}");
         _summaryWindowStart = Time.time;
         _windowSleeps = _windowWakes = 0;
         _wakeByHuman = _wakeByAwakeBot = _wakeByExtract = _wakeByTargeted = _wakeByDamage = _wakeByScope = 0;
         _farBlockedCombat = _farBlockedLoot = _farBlockedDoor = _farBlockedExtract = _farBlockedState = 0;
-        _farBlockedBleeding = _farBlockedCooldown = 0;
+        _farBlockedBleeding = _farBlockedCooldown = _farBlockedHealing = _farBlockedHands = 0;
         _blockedProximity = _blockedFloor = 0;
         _windowFights = 0;
         _windowShotsPlayed = 0;
+        _windowShotsDropped = 0;
+        _windowPatchUps = 0;
         VisionBlocks = 0;
+        BrainTicksSkipped = 0;
     }
 
     // ── Poll world scan ─────────────────────────────────────────────────
@@ -430,7 +533,7 @@ public class DormancySystem
     private void ScanWorld()
     {
         _humanPositions.Clear();
-        _targetedProfileIds.Clear();
+        _targetedBy.Clear();
 
         var players = _gameWorld.AllAlivePlayersList;
         for (var i = 0; i < players.Count; i++)
@@ -447,9 +550,15 @@ public class DormancySystem
                     continue;
                 }
 
-                // Build the "who is being targeted" set from every awake bot's current goal enemy, ORBIT or not.
-                var goalPerson = player.AIData.BotOwner?.Memory?.GoalEnemy?.Person;
-                if (goalPerson != null) _targetedProfileIds.Add(goalPerson.ProfileId);
+                // Native ghosts can retain enemy memory during a simulated fight. Only a live,
+                // active body can supply a targeting threat, regardless of who drives its brain.
+                var bot = player.AIData.BotOwner;
+                if (DormantProfileIds.Contains(player.ProfileId) || bot is not { BotState: EBotState.Active }
+                    || !bot.gameObject.activeInHierarchy) continue;
+                var goalPerson = bot.Memory?.GoalEnemy?.Person;
+                if (goalPerson != null && !(_cfg.NativeGhostMovement && GhostMovementEnabled
+                    && NativeGhostSystem.CanRetainEnemy(bot)))
+                    _targetedBy.TryAdd(goalPerson.ProfileId, player);
             }
             catch
             {
@@ -497,14 +606,16 @@ public class DormancySystem
             if (MinSqrDistanceToHumans(squad.Members[i].Position) <= gate)
                 return false;
 
-        // Temporal hysteresis: a woken squad stays awake long enough for SAIN to actually do something.
-        if (Time.time - squad.DormancyWokeAt < WakeCooldownSeconds)
+        // The wake cause selects the delay; all physical safety gates remain below.
+        if (Time.time < squad.DormancySleepAllowedAt)
         {
             _farBlockedCooldown++;
             return false;
         }
 
-        if (squad.ExtractRequested) { _farBlockedExtract++; return false; }
+        // Extract-bound squads may keep ghosting toward the exfil: they only must stay awake
+        // once close enough for the actual trigger interaction.
+        if (squad.ExtractRequested && ExtractProximityWake(squad) != null) { _farBlockedExtract++; return false; }
 
         for (var i = 0; i < squad.Members.Count; i++)
         {
@@ -512,21 +623,113 @@ public class DormancySystem
             var bot = agent.Bot;
             if (bot == null || bot.IsDead || bot.BotState != EBotState.Active) { _farBlockedState++; return false; }
             if (!bot.gameObject.activeSelf) { _farBlockedState++; return false; } // someone else owns the GameObject — never fight over it
-            if (agent.SoloExtractRequested) { _farBlockedExtract++; return false; }
-            if (agent.Objective.Status == ObjectiveStatus.Looting) { _farBlockedLoot++; return false; } // let the loot animation finish
-            if (Time.time < agent.Movement.DoorInteractHoldUntil) { _farBlockedDoor++; return false; } // mid door interaction
-            if (bot.Memory != null && (bot.Memory.GoalEnemy != null || bot.Memory.IsUnderFire)) { _farBlockedCombat++; return false; }
-            if (_targetedProfileIds.Contains(agent.Player.ProfileId)) { _farBlockedCombat++; return false; }
-            if (Time.time - agent.LastHpDropTime < HpStableSeconds) { _farBlockedBleeding++; return false; }
+            if (agent.SoloExtractRequested && (agent.SoloExtractIsEmergency || NearOwnExfil(agent))) { _farBlockedExtract++; return false; }
+            var loot = agent.LootHandler;
+            if (loot != null && loot.LootTaskRunning && !_cfg.GhostLooting)
+            { _farBlockedLoot++; return false; }
+            if (bot.Memory != null && (bot.Memory.GoalEnemy != null || bot.Memory.IsUnderFire))
+            {
+                _farBlockedCombat++;
+                return ReportInitialSleepCombatBlock(bot, bot.Memory.IsUnderFire ? "under-fire" : "goal-enemy");
+            }
+            if (_targetedBy.TryGetValue(agent.Player.ProfileId, out var targeting))
+            {
+                _farBlockedCombat++;
+                return ReportInitialSleepCombatBlock(bot, "targeted", targeting);
+            }
+            var bodyReady = loot != null ? loot.CanEnterGhost : !GhostBodyTransition.Busy(agent.Player);
+            if (!bodyReady)
+            {
+                if (loot?.LootTaskRunning == true) _farBlockedLoot++;
+                else if (Time.time < agent.Movement.DoorInteractHoldUntil) _farBlockedDoor++;
+                else _farBlockedHands++;
+                return false;
+            }
+            // A body mid-heal stays awake: deactivating it freezes the meds animation, Medecine.Using
+            // never clears and the bot cannot walk once it wakes.
+            if (bot.Medecine is { Using: true }) { _farBlockedHealing++; return false; }
+            if (InventoryOperationInFlight(agent)) { _farBlockedHands++; return false; }
+            if (Time.time - agent.LastHpDropTime < HpStableSeconds)
+            {
+                _farBlockedBleeding++;
+                TryGhostPatchUp(agent);
+                return false;
+            }
         }
         return true;
     }
 
+    /// <summary>Non-null when an extract-bound member is close enough to its exfil objective that
+    /// the real AI must take over for the trigger interaction. Members not yet dispatched onto an
+    /// Exfil waypoint report null: they keep ghosting toward it.</summary>
+    private static string ExtractProximityWake(Squad squad)
+    {
+        for (var i = 0; i < squad.Members.Count; i++)
+        {
+            var agent = squad.Members[i];
+            if (NearOwnExfil(agent))
+                return $"{agent} near exfil (<{ExtractWakeDistance:F0}m)";
+        }
+        return null;
+    }
+
+    private static bool NearOwnExfil(Agent agent)
+    {
+        return agent.Objective.Location is { Category: WaypointCategory.Exfil } exfil
+               && (agent.Position - exfil.Position).sqrMagnitude <= ExtractWakeDistanceSqr;
+    }
+
+    /// <summary>Simulated self-care for a FAR, out-of-combat bot whose HP keeps dropping. The bleed gate
+    /// kept such bots awake for minutes at a time in the release-raid logs (bleeding=59/60 polls), so
+    /// strip the negative effects the way a stim would: the drop stops and the 15s gate can clear.
+    /// Rate-limited per bot; a drop that survives the patch-up (custom effects, environmental damage)
+    /// keeps blocking sleep exactly as before, so the old wake/sleep bleed loop stays impossible.</summary>
+    private void TryGhostPatchUp(Agent agent)
+    {
+        if (Time.time - agent.LastGhostPatchUpAt < GhostPatchUpCooldownSeconds) return;
+        agent.LastGhostPatchUpAt = Time.time;
+        if (!GhostPatchUp(agent.Player)) return;
+        _windowPatchUps++;
+        Log.Info($"{agent} ghost patch-up: negative effects removed (HP still dropping out of combat, far from everyone)");
+    }
+
+    private void TryGhostPatchUpVanilla(BotOwner bot)
+    {
+        if (_vanillaPatchUpAt.TryGetValue(bot, out var at) && Time.time - at < GhostPatchUpCooldownSeconds) return;
+        _vanillaPatchUpAt[bot] = Time.time;
+        if (!GhostPatchUp(bot.GetPlayer)) return;
+        _windowPatchUps++;
+        Log.Info($"vanilla {bot.GetPlayer?.Profile?.Nickname} ghost patch-up: negative effects removed");
+    }
+
+    private static bool GhostPatchUp(Player player)
+    {
+        try
+        {
+            var hc = player?.ActiveHealthController;
+            if (hc is not { IsAlive: true }) return false;
+            hc.RemoveNegativeEffects(EBodyPart.Common);
+            return true;
+        }
+        catch
+        {
+            // Half-despawned body: nothing to patch.
+            return false;
+        }
+    }
+
     /// <summary>Why a dormant squad must wake, or null to keep sleeping. The string goes straight to the
     /// wake log line so a single raid read tells premature wakes from legit ones.</summary>
-    private string WakeReason(Squad squad)
+    private GhostWakeReason? WakeReason(Squad squad, bool proximity = true)
     {
-        if (squad.ExtractRequested) { _wakeByExtract++; return "squad extract requested"; }
+        GhostWakeReason? reason = null;
+        // Extract-bound squads ghost their way to the exfil and only wake shortly before its
+        // radius, so the real AI handles just the trigger interaction (not the whole walk).
+        if (squad.ExtractRequested)
+        {
+            var extractWake = ExtractProximityWake(squad);
+            if (extractWake != null) reason = new(GhostWakeCause.Extraction, extractWake);
+        }
 
         // The awake-bot trigger gets a short grace after sleep entry — that alone killed the 2 Hz
         // ping-pong pairs. Human proximity, damage, targeting and extracts always wake instantly.
@@ -535,22 +738,27 @@ public class DormancySystem
         for (var i = 0; i < squad.Members.Count; i++)
         {
             var agent = squad.Members[i];
-            if (agent.SoloExtractRequested) { _wakeByExtract++; return $"{agent} solo extract"; }
-            if (_targetedProfileIds.Contains(agent.Player.ProfileId)) { _wakeByTargeted++; return $"{agent} targeted"; }
+            if (agent.SoloExtractRequested && (agent.SoloExtractIsEmergency || NearOwnExfil(agent)))
+            {
+                reason ??= new GhostWakeReason(GhostWakeCause.Extraction,
+                    agent.SoloExtractIsEmergency ? $"{agent} emergency solo extract" : $"{agent} solo extract near exfil");
+            }
+            if (_targetedBy.TryGetValue(agent.Player.ProfileId, out var targetingPlayer))
+                return new(GhostWakeCause.Targeted, $"{agent} targeted by {targetingPlayer.Profile?.Nickname} [{targetingPlayer.ProfileId}]");
             // Position-based damage (border minefields at least) lands on inactive bodies, and a sleeper
             // can neither react nor heal — hand it back to SAIN immediately.
             var hp = TotalHp(agent);
             if (hp < agent.DormantHpBaseline - 1f)
             {
-                _wakeByDamage++;
-                return $"{agent} took {agent.DormantHpBaseline - hp:F0} damage while dormant";
+                return new(GhostWakeCause.Damage, $"{agent} took {agent.DormantHpBaseline - hp:F0} damage while dormant at {agent.Position}" +
+                       (DangerZones.IsInside(agent.Position) ? " (inside a border/minefield zone)" : ""));
             }
             var humanSqr = MinSqrDistanceToHumans(agent.Position);
-            if (humanSqr <= _wakeDistanceSqr) { _wakeByHuman++; return $"human at {Mathf.Sqrt(humanSqr):F0}m"; }
-            if (InScopedView(agent.Position, out var scopeDist)) { _wakeByScope++; return $"in scoped view at {scopeDist:F0}m"; }
-            if (awakeBotTriggerArmed && AnyAwakeBotNear(agent.Position, squad)) { _wakeByAwakeBot++; return $"awake bot near {agent}"; }
+            if (humanSqr <= _wakeDistanceSqr) reason ??= new GhostWakeReason(GhostWakeCause.HumanProximity, $"human at {Mathf.Sqrt(humanSqr):F0}m");
+            if (!reason.HasValue && InScopedView(agent.Position, out var scopeDist)) reason = new(GhostWakeCause.ScopedView, $"in scoped view at {scopeDist:F0}m");
+            if (!reason.HasValue && proximity && awakeBotTriggerArmed && AnyAwakeBotNear(agent.Position, squad)) reason = new(GhostWakeCause.BotProximity, $"awake bot near {agent}");
         }
-        return null;
+        return reason;
     }
 
     private float MinSqrDistanceToHumans(Vector3 position)
@@ -596,6 +804,7 @@ public class DormancySystem
             if (player.Profile?.Info?.Settings?.Role == WildSpawnType.shooterBTR) continue;
 
             var owner = player.AIData.BotOwner;
+            if (!IsActivatedNeighbour(player)) continue;
             if (owner != null && ownSquad != null && IsMemberBot(ownSquad, owner)) continue;
             if (excludeCandidates && owner != null && IsCandidateBot(owner)) continue;
             return true;
@@ -626,6 +835,54 @@ public class DormancySystem
 
     // ── ORBIT squad sleep / wake mechanics ──────────────────────────────
 
+    // An operation that is still registered after this long is stuck for good, asleep or not.
+    private const float InventoryBusyMaxHoldSeconds = 15f;
+
+    /// <summary>
+    /// True while the body has an inventory operation in flight (a reload, a magazine check, an item going in
+    /// or out of the hands). BSG keeps such an operation registered as active until its hands animation ends,
+    /// and refuses every later operation that touches the same item or the same cells ("Can not execute").
+    /// Deactivating the body freezes the animation, so the operation would stay active for the whole sleep:
+    /// Interchange raid, mikufilck fell asleep 9 frames after its fight and 15 of its ghost loot operations
+    /// were refused. Same idea as the mid-heal gate above. Bounded, so an operation that never completes on
+    /// an awake body cannot keep its squad awake for the rest of the raid.
+    /// </summary>
+    private static bool InventoryOperationInFlight(Agent agent)
+    {
+        try
+        {
+            var controller = agent.Player?.InventoryController;
+            if (controller == null) return false;
+            ItemEventArgs first = null;
+            var count = 0;
+            foreach (var activeEvent in controller.SelectEvents<ItemEventArgs>())
+            {
+                first ??= activeEvent;
+                count++;
+            }
+            if (count == 0)
+            {
+                agent.InventoryBusySince = -1f;
+                return false;
+            }
+            if (float.IsPositiveInfinity(agent.InventoryBusySince)) return false; // released as stuck, until the list empties
+            if (agent.InventoryBusySince < 0f)
+            {
+                agent.InventoryBusySince = Time.time;
+                Log.Debug($"{agent} stays awake: {count} inventory operation(s) in flight ({first.GetType().Name} on {first.Item?.LocalizedName() ?? "?"}, {first.Status})");
+                return true;
+            }
+            if (Time.time - agent.InventoryBusySince < InventoryBusyMaxHoldSeconds) return true;
+            Log.Info($"{agent} still has {count} inventory operation(s) in flight after {InventoryBusyMaxHoldSeconds:F0}s ({first.GetType().Name} on {first.Item?.LocalizedName() ?? "?"}, {first.Status}): stuck, no longer holding the body awake");
+            agent.InventoryBusySince = float.PositiveInfinity;
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private void SleepSquad(Squad squad)
     {
         var minHumanSqr = float.MaxValue;
@@ -648,10 +905,13 @@ public class DormancySystem
         try
         {
             // Questing Bots' proven recipe, in this order.
+            agent.LootHandler?.EnterGhost(agent);
+            _movementSystem.PrepareGhostDoorHandoff(agent);
             bot.DecisionQueue.Clear();
             bot.Memory.GoalEnemy = null;
             bot.PatrollingData.Pause();
             bot.gameObject.SetActive(false);
+            ThrottleBrain(bot);
         }
         catch (System.Exception e)
         {
@@ -664,15 +924,30 @@ public class DormancySystem
         agent.IsDormant = true;
         _dormantAgents.Add(agent);
         DormantProfileIds.Add(agent.Player.ProfileId);
+        FinishSpawnProtection(bot);
     }
 
-    private void WakeSquad(Squad squad, string reason)
+    private void RecordWake(GhostWakeCause cause)
+    {
+        switch (cause)
+        {
+            case GhostWakeCause.HumanProximity: _wakeByHuman++; break;
+            case GhostWakeCause.ScopedView: _wakeByScope++; break;
+            case GhostWakeCause.BotProximity: _wakeByAwakeBot++; break;
+            case GhostWakeCause.Extraction: _wakeByExtract++; break;
+            case GhostWakeCause.Targeted: _wakeByTargeted++; break;
+            case GhostWakeCause.Damage: _wakeByDamage++; break;
+        }
+    }
+
+    private void WakeSquad(Squad squad, GhostWakeReason reason)
     {
         for (var i = 0; i < squad.Members.Count; i++)
             WakeAgent(squad.Members[i]);
-        squad.DormancyWokeAt = Time.time;
+        squad.DormancySleepAllowedAt = Time.time + reason.CooldownSeconds;
         _windowWakes++;
-        Log.Info($"{squad} awake: {reason} ({_dormantAgents.Count} still dormant)");
+        RecordWake(reason.Cause);
+        Log.Info($"{squad} awake: {reason.Message} ({_dormantAgents.Count} still dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
     }
 
     private void WakeAgent(Agent agent)
@@ -691,9 +966,29 @@ public class DormancySystem
         try
         {
             // Questing Bots' proven recipe: PostActivate is mandatory, deactivation leaves BotState=NonActive.
+            UnthrottleBrain(bot);
             bot.gameObject.SetActive(true);
             bot.PatrollingData.Unpause();
             bot.PostActivate();
+            // Ground and fall bookkeeping were frozen while dormant (DormantGroundCollisionPatch): restart
+            // them from the current height so a ghost that walked downhill does not "land" from its
+            // sleep altitude on the first live tick.
+            player.MovementContext?.ResetFlying();
+            // A heal that was in flight when the body went inactive never finished its animation and
+            // leaves Medecine.Using stuck; putting the main weapon back in hands clears the state.
+            if (bot.Medecine is { Using: true })
+            {
+                Log.Info($"{agent} woke with a stale meds state, taking the main weapon back in hands");
+                try { bot.WeaponManager?.Selector?.TakeMainWeapon(); } catch { }
+            }
+
+            // Gear equipped while asleep never reached the hands (no animation on an inactive body): refresh
+            // the weapon list and redraw the main weapon now that the body is live again.
+            if (agent.GhostHandsResync)
+            {
+                agent.GhostHandsResync = false;
+                Orbit.Looting.WeaponSwap.WeaponSwapper.ResyncHandsAfterWake(bot, agent.ToString());
+            }
 
             // Ghost movement can leave the body marginally off-mesh (or squarely off it when the wake
             // lands mid-segment on a slope); snap back before the mover resumes. Path corners are
@@ -702,16 +997,17 @@ public class DormancySystem
             {
                 var snapDist = (hit.position - agent.Position).magnitude;
                 if (snapDist > 0.05f) Log.Debug($"{agent} wake navmesh snap: {snapDist:F2}m");
-                player.Teleport(hit.position);
+                BotLandingGuard.Wake(bot, hit.position, () => _movementSystem.ResumeGroundPlacement(agent));
             }
             else if (TryNearestPathCorner(agent, out var cornerPos))
             {
-                Log.Warning($"{agent} woke OFF-MESH at {agent.Position} — snapping to path corner {cornerPos}");
-                player.Teleport(cornerPos);
+                Log.Warning($"{agent} woke OFF-MESH at {agent.Position}, checking path corner {cornerPos} for a nearby physical landing");
+                BotLandingGuard.Wake(bot, cornerPos, () => _movementSystem.ResumeGroundPlacement(agent));
             }
             else
             {
-                Log.Warning($"{agent} woke OFF-MESH at {agent.Position} with no path corner to snap to — waking in place");
+                BotLandingGuard.Wake(bot, agent.Position, () => _movementSystem.ResumeGroundPlacement(agent));
+                Log.Warning($"{agent} woke OFF-MESH at {agent.Position} with no path corner to snap to");
             }
 
             // Unity forgets Physics.IgnoreCollision pairs while colliders are disabled — re-apply the per-door
@@ -751,7 +1047,6 @@ public class DormancySystem
             : movement.Path[current];
         return true;
     }
-
 
     // ── Scoped wake ─────────────────────────────────────────────────────
 
@@ -912,16 +1207,13 @@ public class DormancySystem
             {
                 var a = _ghostUnits[i];
                 var b = _ghostUnits[j];
-                // Savage-family units (scavs, bosses, cultists...) are allies of each other; every
-                // pairing involving a PMC-side unit is hostile (PMC vs PMC included, SPT free-for-all).
-                if (a.IsSavage && b.IsSavage) continue;
+                // Who fights whom is the game's own verdict, asked to both groups (see UnitsHostile).
+                if (!UnitsHostile(a, b)) continue;
 
                 // A unit mid-fight can't be pulled into a second one until its window closes.
                 if (UnitInFight(a) || UnitInFight(b)) continue;
 
-                var distSqr = MinUnitDistanceSqr(a, b, out var posA, out var posB);
-                var reach = Mathf.Max(a.Reach, b.Reach);
-                if (distSqr > reach * reach) continue;
+                if (!TryFindGhostContact(a, b, out var posA, out var posB, out var distSqr, out var reach, out var sniperDetection)) continue;
                 var dist = Mathf.Sqrt(distSqr);
 
                 // Terrain/structure LoS between the closest members, THREE rays that must ALL be
@@ -954,17 +1246,104 @@ public class DormancySystem
                 }
                 _skirmishPairSeenAt[pairKey] = Time.time;
 
+                var fightDistance = sniperDetection ? Vector3.Distance(posA, posB) : dist;
+                if (sniperDetection)
+                    Log.Info($"GHOST SNIPER CONTACT: {a.Label} vs {b.Label} horizontal={dist:F0}m actual={fightDistance:F0}m reach={reach:F0}m");
                 if (_fightsMode == GhostFightsMode.Real)
-                    WakeBothForRealFight(a, b, dist);
+                    WakeBothForRealFight(a, b, fightDistance);
                 else
-                    ResolveFight(a, b, dist, posA, posB);
+                    ResolveFight(a, b, fightDistance, posA, posB);
             }
         }
     }
 
+    // Pair verdicts from the hostility settings, cached for the raid: BSG's test rolls the "chanced enemy"
+    // odds on every call, so asking again at 2 Hz would turn every chanced pair hostile within seconds.
+    private readonly Dictionary<string, bool> _hostilityCache = new();
+    private readonly HashSet<string> _hostilityRolesLogged = new();
+
+    /// <summary>
+    /// Whether two ghost units would fight, by the game's own rules rather than a side shortcut. The old test
+    /// (two Savage-side units never fight, anything involving a PMC does) was wrong for every modded faction,
+    /// which all spawn on the Savage side: RUAF and Black Division are enemies of the scavs and of each other,
+    /// scavs attack UNTAR, cultists are hostile to most of them, while UNTAR and RUAF only WARN each other;
+    /// and PMC squads of the same faction are not always hostile either. BotsGroup.IsPlayerEnemy is what an
+    /// awake bot runs when it sees someone: the bot-type enemy / friend / warn lists of the location's
+    /// hostility settings (where MoreBotsAPI factions, SPT's PMC config, ABPS and RvR write theirs), then the
+    /// per-side behaviour. One hostile direction is enough, the other side defends itself. Grudges picked up
+    /// while awake (BotsGroup.Enemies) are read live on top of the cached verdict.
+    /// </summary>
+    private bool UnitsHostile(GhostUnit a, GhostUnit b)
+    {
+        var botA = LeadBot(a);
+        var botB = LeadBot(b);
+        if (botA == null || botB == null) return !(a.IsSavage && b.IsSavage);
+        try
+        {
+            var groupA = botA.BotsGroup;
+            var groupB = botB.BotsGroup;
+            if (groupA == null || groupB == null) return !(a.IsSavage && b.IsSavage);
+            if (ReferenceEquals(groupA, groupB)) return false;
+            // IPlayer handles come from the game world's bridge: upcasting Player to IPlayer here would drag
+            // the voice-chat assembly (Player implements IDissonancePlayer) into ORBIT's compile references.
+            var playerA = _gameWorld.GetAlivePlayerBridgeByProfileID(botA.ProfileId)?.iPlayer;
+            var playerB = _gameWorld.GetAlivePlayerBridgeByProfileID(botB.ProfileId)?.iPlayer;
+            if (playerA == null || playerB == null) return !(a.IsSavage && b.IsSavage);
+            if (groupA.IsEnemy(playerB) || groupB.IsEnemy(playerA))
+            {
+                // BSG registers known hostiles on a group's enemy list as soon as they meet or spawn, so most
+                // hostile pairs end here: log them too, or the matrix in the log only shows the friendly ones.
+                LogHostilityOnce(botA, botB, true, "already on each other's enemy list");
+                return true;
+            }
+
+            var key = string.CompareOrdinal(a.Key, b.Key) < 0 ? a.Key + "|" + b.Key : b.Key + "|" + a.Key;
+            if (_hostilityCache.TryGetValue(key, out var cached)) return cached;
+            var aHatesB = groupA.IsPlayerEnemy(playerB);
+            var bHatesA = groupB.IsPlayerEnemy(playerA);
+            var hostile = aHatesB || bHatesA;
+            _hostilityCache[key] = hostile;
+
+            LogHostilityOnce(botA, botB, hostile, $"settings: first attacks second {aHatesB}, second attacks first {bHatesA}");
+            return hostile;
+        }
+        catch
+        {
+            return !(a.IsSavage && b.IsSavage); // torn-down group: the old side rule
+        }
+    }
+
+    /// <summary>The weapon a bot brings to a simulated fight: what it holds, or for a sleeper the better
+    /// weapon it equipped while asleep and has not drawn yet (hands are resynchronised at wake). Sounds keep
+    /// following the weapon in hands, the only one with a live sound player.</summary>
+    private Item FightWeaponOf(BotOwner bot)
+    {
+        if (bot == null) return null;
+        var agent = _botRoster.GetAgent(bot);
+        if (agent != null && agent.IsDormant && agent.GhostBestWeapon != null) return agent.GhostBestWeapon;
+        return bot.GetPlayer?.HandsController?.Item;
+    }
+
+    /// <summary>One Info line per pair of bot types and verdict per raid: the hostility matrix as the game
+    /// sees it.</summary>
+    private void LogHostilityOnce(BotOwner botA, BotOwner botB, bool hostile, string why)
+    {
+        var roleA = botA.Profile?.Info?.Settings?.Role.ToString() ?? "?";
+        var roleB = botB.Profile?.Info?.Settings?.Role.ToString() ?? "?";
+        var roleKey = string.CompareOrdinal(roleA, roleB) < 0 ? roleA + "|" + roleB : roleB + "|" + roleA;
+        if (!_hostilityRolesLogged.Add(roleKey + (hostile ? "+" : "-"))) return;
+        Log.Info($"GHOST HOSTILITY: {roleA} vs {roleB}: {(hostile ? "hostile" : "not hostile")} ({why})");
+    }
+
+    private static BotOwner LeadBot(GhostUnit unit)
+        => unit.Agents.Count > 0 ? unit.Agents[0].Bot
+            : unit.VanillaBots.Count > 0 ? unit.VanillaBots[0]
+            : null;
+
     private void BuildGhostUnits(List<Squad> squads)
     {
         _ghostUnits.Clear();
+        _darkness = CurrentDarkness();
 
         for (var i = 0; i < squads.Count; i++)
         {
@@ -981,9 +1360,13 @@ public class DormancySystem
             for (var m = 0; m < squad.Members.Count; m++)
             {
                 unit.Agents.Add(squad.Members[m]);
-                unit.Reach = Mathf.Max(unit.Reach, UnitMemberReach(squad.Members[m].Bot));
+                var memberReach = UnitMemberReach(squad.Members[m].Bot);
+                unit.Reach = Mathf.Max(unit.Reach, memberReach);
+                unit.SniperReach = Mathf.Max(unit.SniperReach, SniperDetectionReach(squad.Members[m].Bot, memberReach));
                 unit.KillRange = Mathf.Max(unit.KillRange, WeaponKillRange(squad.Members[m].Player));
+                unit.NightCapable |= HasNightVision(squad.Members[m].Bot);
             }
+            ApplyNightReach(unit);
             _ghostUnits.Add(unit);
         }
 
@@ -1002,30 +1385,19 @@ public class DormancySystem
             };
             for (var m = 0; m < group.Count; m++)
             {
+                // Spawns still initializing can coexist with sleepers until their next poll.
+                // Only actual Ghosts participate in simulated fights.
+                if (!_vanillaDormant.Contains(group[m])) continue;
                 unit.VanillaBots.Add(group[m]);
-                unit.Reach = Mathf.Max(unit.Reach, UnitMemberReach(group[m]));
+                var memberReach = UnitMemberReach(group[m]);
+                unit.Reach = Mathf.Max(unit.Reach, memberReach);
+                unit.SniperReach = Mathf.Max(unit.SniperReach, SniperDetectionReach(group[m], memberReach));
                 unit.KillRange = Mathf.Max(unit.KillRange, WeaponKillRange(group[m].GetPlayer));
+                unit.NightCapable |= HasNightVision(group[m]);
             }
+            ApplyNightReach(unit);
             _ghostUnits.Add(unit);
         }
-    }
-
-    private static float MinUnitDistanceSqr(GhostUnit a, GhostUnit b, out Vector3 closestA, out Vector3 closestB)
-    {
-        var min = float.MaxValue;
-        closestA = default;
-        closestB = default;
-        for (var i = 0; i < a.Count; i++)
-        {
-            var pa = i < a.Agents.Count ? a.Agents[i].Position : a.VanillaBots[i - a.Agents.Count].GetPlayer.Position;
-            for (var j = 0; j < b.Count; j++)
-            {
-                var pb = j < b.Agents.Count ? b.Agents[j].Position : b.VanillaBots[j - b.Agents.Count].GetPlayer.Position;
-                var d = (pa - pb).sqrMagnitude;
-                if (d < min) { min = d; closestA = pa; closestB = pb; }
-            }
-        }
-        return min;
     }
 
     /// <summary>Engagement reach of one member: base range scaled by the best optic on the weapon in
@@ -1039,7 +1411,7 @@ public class DormancySystem
         var mag = 1f;
         try
         {
-            var weapon = bot.GetPlayer?.HandsController?.Item;
+            var weapon = FightWeaponOf(bot);
             if (weapon != null)
             {
                 foreach (var sight in weapon.GetItemComponentsInChildren<SightComponent>(false))
@@ -1058,6 +1430,91 @@ public class DormancySystem
         return Mathf.Min(SkirmishReachCap, SkirmishBaseDetectRange * mag);
     }
 
+    // Night model. A unit with no night vision (NVG or thermal goggles on the head, thermal / NV scope on
+    // the gun in hand) loses most of its detection reach in the dark, optics included: magnification does
+    // not help an eye that sees nothing. It also fights at a handicap against a unit that can see (first
+    // shots, target acquisition); two blind sides or two equipped sides stay even, they simply meet
+    // closer. Darkness follows the raid clock: full from 22:30 to 04:30 with a one-hour ramp on each side.
+    // Factory night is always dark; Factory day, Labs and the Labyrinth are lit interiors, never night.
+    private const float NightBlindReach = 35f;
+    private const float NightBlindStrengthMul = 0.7f;
+    private const string SpecialScopeParentId = "55818aeb4bdc2ddc698b456a"; // thermal and NV scopes
+
+    private static float CurrentDarkness()
+    {
+        try
+        {
+            var world = Singleton<GameWorld>.Instance;
+            if (world == null) return 0f;
+            var map = (world.LocationId ?? "").ToLowerInvariant();
+            if (map == "factory4_night") return 1f;
+            if (map == "factory4_day" || map == "laboratory" || map == "labyrinth") return 0f;
+            var gameTime = world.GameDateTime;
+            if (gameTime == null) return 0f;
+            var hour = (float)gameTime.Calculate().TimeOfDay.TotalHours;
+            if (hour >= 22.5f || hour < 4.5f) return 1f;
+            if (hour >= 21.5f) return Mathf.InverseLerp(21.5f, 22.5f, hour);
+            if (hour < 5.5f) return 1f - Mathf.InverseLerp(4.5f, 5.5f, hour);
+            return 0f;
+        }
+        catch
+        {
+            return 0f; // no clock on this map: treat as day, nothing changes
+        }
+    }
+
+    private bool HasNightVision(BotOwner bot)
+    {
+        if (bot == null) return false;
+        if (_nightVisionCache.TryGetValue(bot, out var cached) && Time.time - cached.at < 60f)
+            return cached.has;
+        var has = false;
+        try
+        {
+            // NVG on the helmet: BSG's own flag, set when the headwear carries a NightVisionComponent.
+            has = bot.NightVision is { HaveNightVision: true };
+            var player = bot.GetPlayer;
+            if (!has && player != null)
+            {
+                // Thermal goggles are a separate component that BSG's flag ignores.
+                if (player.Inventory?.Equipment?.GetSlot(EquipmentSlot.Headwear)?.ContainedItem is CompoundItem headwear)
+                {
+                    foreach (var _ in headwear.GetItemComponentsInChildren<ThermalVisionComponent>())
+                    {
+                        has = true;
+                        break;
+                    }
+                }
+                // Thermal / NV scope on the weapon in hand (BSG's "special scopes").
+                if (!has && FightWeaponOf(bot) is Weapon weapon)
+                {
+                    foreach (var sight in weapon.GetItemComponentsInChildren<SightComponent>(false))
+                    {
+                        if (sight.Item?.Template?.ParentId?.ToString() != SpecialScopeParentId) continue;
+                        has = true;
+                        break;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Disposed/edge-case inventory: no night vision.
+        }
+        _nightVisionCache[bot] = (has, Time.time);
+        return has;
+    }
+
+    private void ApplyNightReach(GhostUnit unit)
+    {
+        if (_darkness <= 0f || unit.NightCapable) return;
+        unit.Reach = Mathf.Lerp(unit.Reach, Mathf.Min(unit.Reach, NightBlindReach), _darkness);
+        unit.SniperReach = Mathf.Lerp(unit.SniperReach, Mathf.Min(unit.SniperReach, NightBlindReach), _darkness);
+    }
+
+    private float NightFightMul(GhostUnit self, GhostUnit other)
+        => _darkness > 0f && !self.NightCapable && other.NightCapable ? Mathf.Lerp(1f, NightBlindStrengthMul, _darkness) : 1f;
+
     /// <summary>
     /// Effective kill distance of the weapon in a member's hands: the game's own per-weapon
     /// bEffDist (what LookSensor uses for real shooting decisions), hard-capped when the LOADED
@@ -1073,7 +1530,7 @@ public class DormancySystem
         var range = DefaultKillRange;
         try
         {
-            if (p.HandsController?.Item is Weapon weapon)
+            if (FightWeaponOf(p.AIData?.BotOwner) is Weapon weapon)
             {
                 range = Mathf.Max(25f, weapon.Template.bEffDist);
                 var ammo = weapon.CurrentAmmoTemplate;
@@ -1184,11 +1641,11 @@ public class DormancySystem
     {
         if (unit.Squad != null)
         {
-            WakeSquad(unit.Squad, reason);
+            WakeSquad(unit.Squad, new(GhostWakeCause.RealFight, reason));
             return;
         }
         if (unit.VanillaKey != null && _vanillaGroups.TryGetValue(unit.VanillaKey, out var group))
-            WakeVanillaGroup(unit.VanillaKey, group, reason);
+            WakeVanillaGroup(unit.VanillaKey, group, new(GhostWakeCause.RealFight, reason));
     }
 
     private void ResolveFight(GhostUnit a, GhostUnit b, float distance, Vector3 posA, Vector3 posB)
@@ -1201,8 +1658,8 @@ public class DormancySystem
         // vs the duel distance — a buckshot squad at 300m fights at a fraction of its strength.
         var gunA = Mathf.Lerp(0.3f, 1f, Mathf.Clamp01(a.KillRange * 1.3f / Mathf.Max(distance, 10f)));
         var gunB = Mathf.Lerp(0.3f, 1f, Mathf.Clamp01(b.KillRange * 1.3f / Mathf.Max(distance, 10f)));
-        var rollA = UnitStrength(a) * rangeA * gunA * Random.Range(0.7f, 1.3f);
-        var rollB = UnitStrength(b) * rangeB * gunB * Random.Range(0.7f, 1.3f);
+        var rollA = UnitStrength(a) * rangeA * gunA * NightFightMul(a, b) * Random.Range(0.7f, 1.3f);
+        var rollB = UnitStrength(b) * rangeB * gunB * NightFightMul(b, a) * Random.Range(0.7f, 1.3f);
         var winner = rollA >= rollB ? a : b;
         var loser = rollA >= rollB ? b : a;
         var ratio = Mathf.Max(rollA, rollB) / Mathf.Max(0.1f, Mathf.Min(rollA, rollB));
@@ -1265,17 +1722,27 @@ public class DormancySystem
         // Pin both squads for the window: no ghost walking and no second fight mid-firefight.
         _unitFightingUntil[winner.Key] = fight.EndsAt;
         _unitFightingUntil[loser.Key] = fight.EndsAt;
+        foreach (var bot in winner.VanillaBots) _nativeGhosts.Pin(bot, fight.EndsAt);
+        foreach (var bot in loser.VanillaBots) _nativeGhosts.Pin(bot, fight.EndsAt);
         if (winner.Squad != null) winner.Squad.GhostFightUntil = fight.EndsAt;
         if (loser.Squad != null) loser.Squad.GhostFightUntil = fight.EndsAt;
 
         _windowFights++;
         Log.Info($"GHOST SKIRMISH at {distance:F0}m: {a.Label} (str {rollA:F1}, reach {a.Reach:F0}m, gun {a.KillRange:F0}m) vs {b.Label} (str {rollB:F1}, reach {b.Reach:F0}m, gun {b.KillRange:F0}m), {winner.Label} wins over {duration:F0}s, {loserDeaths + winnerDeaths} killed");
 
+        if (_darkness > 0f)
+            Log.Info($"GHOST SKIRMISH night: darkness {_darkness:F2}, {a.Label} nightVision={a.NightCapable} (x{NightFightMul(a, b):F2}), {b.Label} nightVision={b.NightCapable} (x{NightFightMul(b, a):F2})");
         QueueFightSounds(a, posA, b, posB, loserDeaths + winnerDeaths, duration, shotsPerSecond);
+        RegisterFightNoise(a, b, duration);
     }
 
     private bool UnitInFight(GhostUnit unit)
-        => _unitFightingUntil.TryGetValue(unit.Key, out var until) && Time.time < until;
+    {
+        if (unit.Squad != null && Time.time < unit.Squad.GhostFightUntil) return true;
+        foreach (var bot in unit.VanillaBots)
+            if (_nativeGhosts.InFight(bot)) return true;
+        return _unitFightingUntil.TryGetValue(unit.Key, out var until) && Time.time < until;
+    }
 
     /// <summary>Advances the in-flight fight windows every frame: due casualties drop, a window whose
     /// participant woke escalates into a REAL fight, and when a window closes normally the survivors'
@@ -1338,6 +1805,8 @@ public class DormancySystem
     {
         _unitFightingUntil.Remove(fight.Winner.Key);
         _unitFightingUntil.Remove(fight.Loser.Key);
+        foreach (var bot in fight.Winner.VanillaBots) _nativeGhosts.Pin(bot, 0f);
+        foreach (var bot in fight.Loser.VanillaBots) _nativeGhosts.Pin(bot, 0f);
         if (fight.Winner.Squad != null) fight.Winner.Squad.GhostFightUntil = -999f;
         if (fight.Loser.Squad != null) fight.Loser.Squad.GhostFightUntil = -999f;
     }
@@ -1374,8 +1843,10 @@ public class DormancySystem
             if (Random.value > woundChance) continue;
             var bot = unit.VanillaBots[i];
             if (!_vanillaDormant.Contains(bot)) continue; // woke mid-window — no invisible wounds
+            var beforeHp = VanillaHp(bot);
             if (!WoundSurvivor(bot.GetPlayer, perMemberDamage)) continue;
             _vanillaHpBaseline[bot] = VanillaHp(bot);
+            _nativeGhosts.RecordSimulatedWound(bot, beforeHp, _vanillaHpBaseline[bot]);
             _vanillaLastHp[bot] = _vanillaHpBaseline[bot];
             _vanillaHpDropAt[bot] = Time.time;
         }
@@ -1387,14 +1858,11 @@ public class DormancySystem
         {
             var hc = player?.ActiveHealthController;
             if (hc is not { IsAlive: true }) return false;
-            var damageInfo = new EFT.Ballistics.DamageInfo
-            {
-                DamageType = EDamageType.Bullet,
-                Damage = damage,
-                Direction = Vector3.forward,
-                HitPoint = player.Position + new Vector3(0f, 1f, 0f),
-            };
-            hc.ApplyDamage(AttritionParts[Random.Range(0, AttritionParts.Length)], damage, damageInfo);
+            // Plain HP loss, no hit processing: ApplyDamage rolled real bleeds and fractures on the
+            // sleeper, and a bleed ticking on the inactive body tripped the damage wake seconds after
+            // the window closed. Both sides then met awake and fought for real (release-raid logs:
+            // damage wake, awakeBot wake, then minutes of combat/proximity blocks).
+            hc.ChangeHealth(AttritionParts[Random.Range(0, AttritionParts.Length)], -damage, default);
             return true;
         }
         catch
@@ -1432,8 +1900,10 @@ public class DormancySystem
             try
             {
                 if (_vanillaHpDropAt.TryGetValue(bot, out var dropAt) && Time.time - dropAt < GhostHealDelaySeconds) continue;
+                var beforeHp = VanillaHp(bot);
                 if (!HealWeakestPart(bot.GetPlayer, heal)) continue;
                 _vanillaHpBaseline[bot] = VanillaHp(bot);
+                _nativeGhosts.RecordSimulatedHealing(bot, beforeHp, _vanillaHpBaseline[bot]);
                 _vanillaLastHp[bot] = _vanillaHpBaseline[bot];
             }
             catch
@@ -1484,11 +1954,18 @@ public class DormancySystem
     {
         if (!_cfg.GhostFightSounds) return;
 
-        var profileA = RandomMemberProfileId(a);
-        var profileB = RandomMemberProfileId(b);
         // Shot count follows the window at the fight's own firing rate (protracted fights trade
         // sporadic pot-shots, not a continuous mag dump), capped to bound the queue.
         var shots = Mathf.Min(90, Mathf.RoundToInt(duration * shotsPerSecond) + casualties * 3);
+
+        // Every member fires its own gun from its own spot (a 3-man squad is heard as three weapons):
+        // each side's half of the budget is split between its members with a random skew.
+        _shooters.Clear();
+        CollectShooters(a, shots / 2, _shooters);
+        var sideBStart = _shooters.Count;
+        CollectShooters(b, shots - shots / 2, _shooters);
+        var profileA = sideBStart > 0 ? _shooters[0].ProfileId : null;
+        var profileB = _shooters.Count > sideBStart ? _shooters[sideBStart].ProfileId : null;
 
         // Fika bridge (Orbit.Fika addon): raised before the local earshot gate, because audibility
         // is a per-listener judgement and each co-op client replays the burst against its own ears.
@@ -1500,6 +1977,7 @@ public class DormancySystem
             ProfileB = profileB,
             Shots = shots,
             Duration = duration,
+            Shooters = new List<Api.OrbitEvents.GhostShooter>(_shooters),
         });
 
         const float earshotSqr = 1500f * 1500f;
@@ -1510,47 +1988,93 @@ public class DormancySystem
             return;
         }
 
-        var soundA = WeaponSoundFromProfile(profileA);
-        var soundB = WeaponSoundFromProfile(profileB);
-        if (soundA == null && soundB == null)
+        if (_shooters.Count == 0)
         {
             Log.Debug("GHOST FIGHT SOUNDS: skipped, no weapon sound player resolved on either side");
             return;
         }
 
-        Log.Info($"GHOST FIGHT SOUNDS: queueing up to {shots} shots over {duration:F1}s, closest human {listenerDist:F0}m");
-        // Each side fires its own schedule shaped by its weapon's capability (bursts for autos,
-        // aimed singles for semi/bolt) — a shared uniform spray made SVDs sound full-auto (RC report).
-        var budgetA = shots / 2;
-        var budgetB = shots - budgetA;
-        if (soundA == null) { budgetB = shots; budgetA = 0; }
-        if (soundB == null) { budgetA = shots; budgetB = 0; }
-        QueueSideShots(soundA, posA, budgetA, duration);
-        QueueSideShots(soundB, posB, budgetB, duration);
+        Log.Info($"GHOST FIGHT SOUNDS: queueing up to {shots} shots from {_shooters.Count} shooter(s) over {duration:F1}s, closest human {listenerDist:F0}m");
+        var engagementDistance = Vector3.Distance(posA, posB);
+        var shootersA = sideBStart;
+        var shootersB = _shooters.Count - sideBStart;
+        for (var i = 0; i < _shooters.Count; i++)
+        {
+            var shooter = _shooters[i];
+            var sound = WeaponSoundFromProfile(shooter.ProfileId);
+            if (sound == null) continue;
+            var weapon = Api.GhostWeaponProfile.From(WeaponFromProfile(shooter.ProfileId), sound, engagementDistance);
+            // Squadmates fire staggered and pause longer the more of them there are, so a five-man
+            // side sounds like a firefight rather than one 4000 rpm gun.
+            var (startOffset, pauseScale) = i < sideBStart
+                ? Api.GhostShotScheduler.SideStagger(i, shootersA)
+                : Api.GhostShotScheduler.SideStagger(i - sideBStart, shootersB);
+            Log.Debug($"GHOST FIGHT SOUNDS: {(i < sideBStart ? "A" : "B")} {DescribeShooter(shooter.ProfileId, sound)}, mode {weapon.Mode} {weapon.CyclicRpm:F0}/{weapon.SemiRpm:F0}rpm bursts {weapon.BurstShare:P0} at {engagementDistance:F0}m, {shooter.Shots} shot(s)");
+            QueueShooterShots(sound, weapon, shooter.Position, shooter.Shots, duration, startOffset, pauseScale);
+        }
     }
 
-    private void QueueSideShots(WeaponSoundPlayer sound, Vector3 pos, int budget, float duration)
+    private readonly List<Api.OrbitEvents.GhostShooter> _shooters = new();
+    private readonly List<(string profile, Vector3 pos, float weight)> _shooterScratch = new();
+
+    /// <summary>Splits one side's shot budget across its members that have a weapon sound player,
+    /// with a random skew so the split never sounds mechanical. Members without a resolvable weapon
+    /// (nothing in hands, despawning) are skipped and their share goes to the others.</summary>
+    private void CollectShooters(GhostUnit unit, int budget, List<Api.OrbitEvents.GhostShooter> into)
+    {
+        if (budget <= 0) return;
+        _shooterScratch.Clear();
+        var totalWeight = 0f;
+        for (var i = 0; i < unit.Count; i++)
+        {
+            var player = i < unit.Agents.Count ? unit.Agents[i].Player : unit.VanillaBots[i - unit.Agents.Count].GetPlayer;
+            var profileId = player?.ProfileId;
+            if (profileId == null || WeaponSoundFromProfile(profileId) == null) continue;
+            var weight = Random.Range(0.5f, 1.5f);
+            _shooterScratch.Add((profileId, player.Position, weight));
+            totalWeight += weight;
+        }
+        if (_shooterScratch.Count == 0) return;
+
+        var assigned = 0;
+        for (var i = 0; i < _shooterScratch.Count; i++)
+        {
+            var (profile, pos, weight) = _shooterScratch[i];
+            var share = i == _shooterScratch.Count - 1
+                ? budget - assigned
+                : Mathf.Max(1, Mathf.RoundToInt(budget * weight / totalWeight));
+            share = Mathf.Min(share, budget - assigned);
+            if (share <= 0) continue;
+            assigned += share;
+            into.Add(new Api.OrbitEvents.GhostShooter { ProfileId = profile, Position = pos, Shots = share });
+        }
+    }
+
+    private void QueueShooterShots(WeaponSoundPlayer sound, Api.GhostWeaponProfile weapon, Vector3 pos, int budget, float duration, float startOffset = 0f, float pauseScale = 1f)
     {
         if (sound == null || budget <= 0) return;
-        var times = Api.GhostShotScheduler.Schedule(sound.IsAutoWeapon, budget, duration);
-        for (var i = 0; i < times.Count; i++)
+        var times = Api.GhostShotScheduler.Schedule(weapon, budget, duration, startOffset, pauseScale);
+        // One entry per TRIGGER PULL, not per round: an automatic weapon's Body clip is a 16-round loop
+        // that must be started once and cut, see GhostShotPlayback.
+        var pulls = Api.GhostShotPlayback.GroupTriggerPulls(times, weapon, sound.IsAutoWeapon);
+        for (var i = 0; i < pulls.Count; i++)
         {
             _pendingShots.Add(new PendingShot
             {
-                At = Time.time + times[i],
-                Pos = pos + new Vector3(Random.Range(-3f, 3f), 0f, Random.Range(-3f, 3f)),
+                At = Time.time + pulls[i].At,
+                // A shooter shifts around its own spot between shots, it never teleports.
+                Pos = pos + new Vector3(Random.Range(-1.5f, 1.5f), 0f, Random.Range(-1.5f, 1.5f)),
                 Sound = sound,
+                Rounds = pulls[i].Rounds,
             });
         }
     }
 
-    private static string RandomMemberProfileId(GhostUnit unit)
+    private Weapon WeaponFromProfile(string profileId)
     {
         try
         {
-            return unit.Agents.Count > 0
-                ? unit.Agents[Random.Range(0, unit.Agents.Count)].Player?.ProfileId
-                : unit.VanillaBots.Count > 0 ? unit.VanillaBots[Random.Range(0, unit.VanillaBots.Count)].GetPlayer?.ProfileId : null;
+            return profileId == null ? null : _gameWorld.GetAlivePlayerByProfileID(profileId)?.HandsController?.Item as Weapon;
         }
         catch
         {
@@ -1570,6 +2094,40 @@ public class DormancySystem
         }
     }
 
+    /// <summary>Distant gunshots in EFT come from the BODY bank: it blends its clips by distance
+    /// (PickClips inside PlayAtPoint picks the far "crack" variants), exactly like FireBullet
+    /// does for real shots. Tails are only the close-range reverb layer: playing them alone at distance
+    /// sounds dull and identical for every weapon (community report: "everything sounds like .50BMG").
+    /// A suppressed weapon's sound player is flagged IsSilenced by the game, so its ghost shots use the
+    /// silenced body and stay authentically quiet.</summary>
+    private static SoundBank PickGhostBank(WeaponSoundPlayer sound)
+    {
+        return sound.IsSilenced
+            ? (sound.BodySilenced != null ? sound.BodySilenced
+                : sound.Body != null ? sound.Body : sound.TailSilenced)
+            : (sound.Body != null ? sound.Body : sound.Tail);
+    }
+
+    /// <summary>Debug-level description of one side of a ghost fight: who fires what, through which
+    /// bank. Lets a raid log confirm the shots match the weapon actually in the shooter's hands.</summary>
+    private string DescribeShooter(string profileId, WeaponSoundPlayer sound)
+    {
+        try
+        {
+            var player = profileId == null ? null : _gameWorld.GetAlivePlayerByProfileID(profileId);
+            var nick = player?.Profile?.Nickname ?? "?";
+            var weapon = player?.HandsController?.Item is Weapon w ? w.LocalizedName() : "(nothing in hands)";
+            var bank = PickGhostBank(sound);
+            return $"{nick} firing {weapon}: {(sound.IsAutoWeapon ? "auto" : "semi/bolt")}, " +
+                   $"{(sound.IsSilenced ? "suppressed" : "unsuppressed")}, bank '{(bank != null ? bank.name : "none")}'" +
+                   $"{(bank != null ? $" rolloff {bank.Rolloff:F0}m" : "")}";
+        }
+        catch
+        {
+            return "(shooter despawned)";
+        }
+    }
+
     private void PumpGhostFightShots()
     {
         var audio = Singleton<BetterAudio>.Instance;
@@ -1585,18 +2143,27 @@ public class DormancySystem
             _pendingShots.RemoveAt(i);
             try
             {
-                // The tail bank IS what a distant gunshot sounds like in EFT; body as fallback. A
-                // suppressed weapon's sound player is flagged IsSilenced by the game, so its ghost
-                // shots use the silenced banks and stay authentically quiet.
-                var bank = shot.Sound.IsSilenced
-                    ? (shot.Sound.TailSilenced != null ? shot.Sound.TailSilenced
-                        : shot.Sound.BodySilenced != null ? shot.Sound.BodySilenced
-                        : shot.Sound.Tail != null ? shot.Sound.Tail : shot.Sound.Body)
-                    : (shot.Sound.Tail != null ? shot.Sound.Tail : shot.Sound.Body);
-                if (bank == null) continue;
                 var listenerDist = Mathf.Sqrt(MinSqrDistanceToHumans(shot.Pos));
-                audio.PlayAtPointDistant(shot.Pos, bank, listenerDist, 1f);
-                _windowShotsPlayed++;
+                if (shot.IsTail)
+                {
+                    Api.GhostShotPlayback.PlayTail(audio, shot.Sound, shot.LoopSource, shot.Pos, listenerDist);
+                    continue;
+                }
+                var rounds = Mathf.Max(1, shot.Rounds);
+                var source = Api.GhostShotPlayback.Play(audio, shot.Sound, shot.Pos, listenerDist, rounds, out var tailDelay);
+                if (source == null)
+                {
+                    _windowShotsDropped += rounds;
+                    continue;
+                }
+                _windowShotsPlayed += rounds;
+                if (tailDelay > 0f)
+                {
+                    _pendingShots.Add(new PendingShot
+                    {
+                        At = Time.time + tailDelay, Pos = shot.Pos, Sound = shot.Sound, IsTail = true, LoopSource = source,
+                    });
+                }
             }
             catch
             {
@@ -1628,7 +2195,7 @@ public class DormancySystem
             var victimPos = idx < unit.Agents.Count
                 ? unit.Agents[idx].Position
                 : unit.VanillaBots[idx - unit.Agents.Count].GetPlayer.Position;
-            var killer = ClosestVisibleSurvivor(opposing, victimPos);
+            var killer = PickVisibleKiller(opposing, victimPos);
             if (killer == null) continue;
             if (idx < unit.Agents.Count)
             {
@@ -1663,25 +2230,40 @@ public class DormancySystem
         return !Physics.Raycast(from, d.normalized, d.magnitude, LayersMaskController.HighPolyWithTerrainMask);
     }
 
-    private Player ClosestVisibleSurvivor(GhostUnit unit, Vector3 targetPos)
+    private readonly List<(Player player, float weight)> _killerCandidates = new();
+
+    /// <summary>Credited killer for a simulated casualty: a weighted random draw among the opposing
+    /// survivors whose gun can plausibly make the shot (a buckshot shotgun never gets a 300m kill even
+    /// when its SVD squadmate is dead) and who have a clear line of sight. Weighted by gun fitness at
+    /// that distance, not "the closest", so kills spread across the squad: with nearest-wins every
+    /// simulated kill of a squad landed on whoever walked in front (release-raid logs).</summary>
+    private Player PickVisibleKiller(GhostUnit unit, Vector3 targetPos)
     {
-        Player best = null;
-        var bestSqr = float.MaxValue;
+        _killerCandidates.Clear();
+        var total = 0f;
         for (var i = 0; i < unit.Count; i++)
         {
             var p = i < unit.Agents.Count ? unit.Agents[i].Player : unit.VanillaBots[i - unit.Agents.Count].GetPlayer;
             if (p == null) continue;
-            var d = (p.Position - targetPos).sqrMagnitude;
-            if (d >= bestSqr) continue;
-            // The credited killer's own gun must plausibly make that shot: a buckshot shotgun never
-            // gets a 300m kill even when its SVD squadmate is dead — the kill falls to whoever CAN.
+            var d = Vector3.Distance(p.Position, targetPos);
             var maxShot = WeaponKillRange(p) * 1.3f;
-            if (d > maxShot * maxShot) continue;
+            if (d > maxShot) continue;
             if (!ClearFightLos(p.Position, targetPos)) continue;
-            best = p;
-            bestSqr = d;
+            // Same fitness curve as the fight roll: a gun comfortably inside its reach is favoured,
+            // one at the edge of it still gets a share.
+            var weight = Mathf.Lerp(0.3f, 1f, Mathf.Clamp01(maxShot / Mathf.Max(d, 10f) - 1f));
+            _killerCandidates.Add((p, weight));
+            total += weight;
         }
-        return best;
+        if (_killerCandidates.Count == 0) return null;
+
+        var roll = Random.value * total;
+        for (var i = 0; i < _killerCandidates.Count; i++)
+        {
+            roll -= _killerCandidates[i].weight;
+            if (roll <= 0f) return _killerCandidates[i].player;
+        }
+        return _killerCandidates[_killerCandidates.Count - 1].player;
     }
 
     /// <summary>
@@ -1729,6 +2311,7 @@ public class DormancySystem
         try
         {
             var bot = victim.Bot;
+            UnthrottleBrain(bot);
             bot.gameObject.SetActive(true);
             bot.PatrollingData.Unpause();
             bot.PostActivate();
@@ -1743,13 +2326,16 @@ public class DormancySystem
 
     private void KillGhostVanilla(BotOwner victim, Player killer)
     {
+        var native = _nativeGhosts.Remove(victim);
         _vanillaDormant.Remove(victim);
+        UnthrottleBrain(victim);
         DormantProfileIds.Remove(victim.GetPlayer?.ProfileId);
         try
         {
             victim.gameObject.SetActive(true);
-            victim.PatrollingData.Unpause();
+            if (!native) victim.PatrollingData.Unpause();
             victim.PostActivate();
+            if (native) NativeGhostSystem.ResyncAfterWake(victim);
             Log.Info($"GHOST SKIRMISH: vanilla {victim.GetPlayer?.Profile?.Nickname} killed in action by {killer?.Profile?.Nickname ?? "?"}");
             KillWithAttribution(victim.GetPlayer, killer);
         }
@@ -1762,13 +2348,14 @@ public class DormancySystem
     // ── Vanilla (non-ORBIT) sleepers ────────────────────────────────────
 
     /// <summary>
-    /// The vanilla (non-ORBIT) side of the per-type policy: any alive bot ORBIT does not drive whose type
-    /// toggle is ON sleeps frozen in place — no ORBIT path, no ghost movement, which suits guard-type
-    /// vanilla AI fine. Groups sleep and wake per BSG BotsGroup so a boss never sleeps apart from its
-    /// followers. Toggled-off types are left completely untouched.
+    /// Native side of the per-type policy: eligible AI without an ORBIT Agent retain their own driver.
+    /// Standard types use the normal distance and population floor; other native types require their
+    /// type toggle. Native movement preserves supported decisions and routes without takeover.
+    /// Groups sleep and wake per BSG BotsGroup. Disabling native movement restores stationary sleep.
     /// </summary>
-    private void UpdateVanilla()
+    private void CollectVanillaGroups()
     {
+        foreach (var group in _vanillaGroups.Values) { group.Clear(); _vanillaGroupPool.Push(group); }
         _vanillaGroups.Clear();
 
         var players = _gameWorld.AllAlivePlayersList;
@@ -1781,16 +2368,28 @@ public class DormancySystem
                 if (!player.AIData.IsAI) continue;
                 var owner = player.AIData.BotOwner;
                 if (owner == null) continue;
-                if (_botRoster.GetAgent(owner) != null) continue; // ORBIT-driven, handled above
+                var agent = _botRoster.GetAgent(owner);
+                if (agent != null)
+                {
+                    NativeAwakeGrenadeDiagnostics.ObserveAgent(owner, agent.IsDormant);
+                    // A late brain registration transfers ownership back to the normal circuit.
+                    if (WakeVanillaBot(owner) && agent.Squad != null)
+                        agent.Squad.DormancySleepAllowedAt = Time.time + new GhostWakeReason(GhostWakeCause.GroupChanged, null).CooldownSeconds;
+                    continue;
+                }
                 var role = owner.Profile?.Info?.Settings?.Role;
-                if (role.HasValue && role.Value.ToString() == "shooterBTR") continue; // never touch the BTR
-                if (!IsDefaultDormant(owner)) continue; // type toggle OFF — leave fully vanilla
+                if (role == WildSpawnType.shooterBTR) continue; // never touch the BTR
+                if (!IsNativeGhostEligible(owner)) continue;
 
                 // A dead body that is still dormant must be re-activated NOW (hidden corpse otherwise).
                 if (player.HealthController is not { IsAlive: true } || owner.IsDead)
                 {
+                    NativePatrolDiagnostics.Forget(owner);
+                    NativeGhostDiagnostics.Forget(owner);
                     if (_vanillaDormant.Remove(owner))
                     {
+                        _nativeGhosts.Remove(owner);
+                        UnthrottleBrain(owner);
                         DormantProfileIds.Remove(player.ProfileId);
                         if (!owner.gameObject.activeSelf) owner.gameObject.SetActive(true);
                         Log.Info($"vanilla sleeper {player.Profile?.Nickname} died while dormant — body re-activated");
@@ -1798,9 +2397,10 @@ public class DormancySystem
                     continue;
                 }
 
+                NativePatrolDiagnostics.Observe(owner, _vanillaDormant.Contains(owner), _nativeGhosts.InFight(owner));
                 var key = (object)owner.BotsGroup ?? owner;
                 if (!_vanillaGroups.TryGetValue(key, out var list))
-                    _vanillaGroups[key] = list = new List<BotOwner>(4);
+                    _vanillaGroups[key] = list = _vanillaGroupPool.Count > 0 ? _vanillaGroupPool.Pop() : new List<BotOwner>(4);
                 list.Add(owner);
             }
             catch
@@ -1809,46 +2409,80 @@ public class DormancySystem
             }
         }
 
+    }
+
+    private readonly Stack<List<BotOwner>> _vanillaGroupPool = new();
+
+    private void UpdateVanilla(ref int awakeStandard, int floor)
+    {
         foreach (var kv in _vanillaGroups)
         {
             var group = kv.Value;
-            if (_vanillaDormant.Contains(group[0]))
+            var dormant = 0;
+            for (var i = 0; i < group.Count; i++)
+                if (_vanillaDormant.Contains(group[i])) dormant++;
+            if (dormant > 0)
             {
-                var reason = VanillaWakeReason(kv.Key, group);
-                if (reason != null) WakeVanillaGroup(kv.Key, group, reason);
+                var reason = dormant == group.Count ? VanillaWakeReason(kv.Key, group)
+                    : new GhostWakeReason(GhostWakeCause.GroupChanged, "group membership changed");
+                if (reason != null)
+                {
+                    var asleepStandard = 0;
+                    foreach (var bot in group)
+                        if (_vanillaDormant.Contains(bot) && !IsDefaultDormant(bot)) asleepStandard++;
+                    WakeVanillaGroup(kv.Key, group, reason.Value);
+                    awakeStandard += asleepStandard;
+                }
             }
             else if (CanVanillaSleep(kv.Key, group))
             {
+                var standard = NativeStandardCount(group);
+                if (standard > 0 && awakeStandard - standard < floor) { _blockedFloor++; continue; }
                 SleepVanillaGroup(kv.Key, group);
+                awakeStandard -= standard;
             }
         }
     }
 
-    private bool CanVanillaSleep(object key, List<BotOwner> group)
+    private bool CanVanillaSleep(object key, List<BotOwner> group, bool joining = false)
     {
-        if (_vanillaGroupWokeAt.TryGetValue(key, out var wokeAt) && Time.time - wokeAt < WakeCooldownSeconds)
-            return false;
+        if (_vanillaSleepAllowedAt.TryGetValue(key, out var allowedAt) && Time.time < allowedAt)
+            return NativeGhostDiagnostics.Refuse(group[0], "wake-cooldown", groupSize: group.Count);
 
+        var gate = NativeStandardCount(group) > 0 ? _sleepDistanceSqr : _scavSleepDistanceSqr;
         for (var i = 0; i < group.Count; i++)
         {
             var bot = group[i];
+            if (joining && (_vanillaDormant.Contains(bot)
+                || bot.BotState is EBotState.PreActive or EBotState.NonActive)) continue;
             var player = bot.GetPlayer;
-            if (bot.BotState != EBotState.Active || !bot.gameObject.activeSelf) return false;
-            if (bot.Memory != null && (bot.Memory.GoalEnemy != null || bot.Memory.IsUnderFire)) return false;
-            if (_targetedProfileIds.Contains(player.ProfileId)) return false;
-            if (MinSqrDistanceToHumans(player.Position) <= _scavSleepDistanceSqr) return false;
+            var humanDistance = Mathf.Sqrt(MinSqrDistanceToHumans(player.Position));
+            bool Refuse(string reason) => NativeGhostDiagnostics.Refuse(bot, reason, humanDistance, group.Count);
+            if (bot.BotState != EBotState.Active || !bot.gameObject.activeSelf) return Refuse("bot-state");
+            if (bot.Memory?.IsUnderFire == true) return Refuse("under-fire");
+            if (bot.Memory?.GoalEnemy != null && !(_cfg.NativeGhostMovement && GhostMovementEnabled
+                && NativeGhostSystem.CanRetainEnemy(bot))) return Refuse("goal-enemy");
+            if (_targetedBy.ContainsKey(player.ProfileId)) return Refuse("targeted");
+            if (humanDistance * humanDistance <= gate) return Refuse("human-distance");
+            if (InScopedView(player.Position, out _)) return Refuse("scoped-view");
+            if (_cfg.NativeGhostMovement && GhostMovementEnabled && !_nativeGhosts.CanSleep(bot, humanDistance, group.Count)) return false;
 
             // Same bleed gate as ORBIT squads.
             var hp = VanillaHp(bot);
             if (_vanillaLastHp.TryGetValue(bot, out var lastHp) && hp < lastHp - 0.5f) _vanillaHpDropAt[bot] = Time.time;
             _vanillaLastHp[bot] = hp;
-            if (_vanillaHpDropAt.TryGetValue(bot, out var dropAt) && Time.time - dropAt < HpStableSeconds) return false;
+            if (_vanillaHpDropAt.TryGetValue(bot, out var dropAt) && Time.time - dropAt < HpStableSeconds)
+            {
+                TryGhostPatchUpVanilla(bot);
+                return Refuse("health-unstable");
+            }
         }
         return true;
     }
 
-    private string VanillaWakeReason(object key, List<BotOwner> group)
+    private GhostWakeReason? VanillaWakeReason(object key, List<BotOwner> group, bool proximity = true)
     {
+        GhostWakeReason? reason = null;
         var awakeBotTriggerArmed = !_vanillaGroupSleptAt.TryGetValue(key, out var sleptAt)
                                    || Time.time - sleptAt >= SleepGraceSeconds;
 
@@ -1856,69 +2490,103 @@ public class DormancySystem
         {
             var bot = group[i];
             var player = bot.GetPlayer;
-            if (_targetedProfileIds.Contains(player.ProfileId)) { _wakeByTargeted++; return $"{player.Profile?.Nickname} targeted"; }
+            var nativeReason = _nativeGhosts.WakeReason(bot);
+            if (nativeReason != null) return new(GhostWakeCause.NativeFallback, nativeReason);
+            if (_targetedBy.TryGetValue(player.ProfileId, out var targetingPlayer))
+                return new(GhostWakeCause.Targeted, $"{player.Profile?.Nickname} targeted by {targetingPlayer.Profile?.Nickname} [{targetingPlayer.ProfileId}]");
             var hp = VanillaHp(bot);
             if (_vanillaHpBaseline.TryGetValue(bot, out var baseline) && hp < baseline - 1f)
             {
-                _wakeByDamage++;
-                return $"{player.Profile?.Nickname} took {baseline - hp:F0} damage while dormant";
+                return new(GhostWakeCause.Damage, $"{player.Profile?.Nickname} took {baseline - hp:F0} damage while dormant at {player.Position}" +
+                       (DangerZones.IsInside(player.Position) ? " (inside a border/minefield zone)" : ""));
             }
             var humanSqr = MinSqrDistanceToHumans(player.Position);
-            if (humanSqr <= _wakeDistanceSqr) { _wakeByHuman++; return $"human at {Mathf.Sqrt(humanSqr):F0}m"; }
-            if (InScopedView(player.Position, out var scopeDist)) { _wakeByScope++; return $"in scoped view at {scopeDist:F0}m"; }
-            if (awakeBotTriggerArmed && AnyAwakeBotNear(player.Position, null)) { _wakeByAwakeBot++; return $"awake bot near {player.Profile?.Nickname}"; }
+            if (humanSqr <= _wakeDistanceSqr) reason ??= new GhostWakeReason(GhostWakeCause.HumanProximity, $"human at {Mathf.Sqrt(humanSqr):F0}m");
+            if (!reason.HasValue && InScopedView(player.Position, out var scopeDist)) reason = new(GhostWakeCause.ScopedView, $"in scoped view at {scopeDist:F0}m");
+            if (!reason.HasValue && proximity && awakeBotTriggerArmed && AnyAwakeBotNear(player.Position, null)) reason = new(GhostWakeCause.BotProximity, $"awake bot near {player.Profile?.Nickname}");
         }
-        return null;
+        return reason;
     }
 
     private void SleepVanillaGroup(object key, List<BotOwner> group)
     {
+        var native = _cfg.NativeGhostMovement && GhostMovementEnabled;
+        var joining = VanillaDormantCount(group) > 0;
+        var added = 0;
         for (var i = 0; i < group.Count; i++)
         {
             var bot = group[i];
+            if (_vanillaDormant.Contains(bot)) continue;
+            if (joining && bot.BotState is EBotState.PreActive or EBotState.NonActive) continue;
             try
             {
-                bot.DecisionQueue.Clear();
-                bot.Memory.GoalEnemy = null;
-                bot.PatrollingData.Pause();
+                if (native)
+                    _nativeGhosts.Add(bot);
+                else
+                {
+                    bot.DecisionQueue.Clear();
+                    bot.Memory.GoalEnemy = null;
+                    bot.PatrollingData.Pause();
+                }
                 bot.gameObject.SetActive(false);
             }
             catch (System.Exception e)
             {
                 Log.Error($"vanilla sleeper {bot.GetPlayer?.Profile?.Nickname} sleep recipe failed: {e}");
+                // Roll back the entire group, including this member if deactivation partly succeeded.
+                _vanillaDormant.Add(bot);
+                WakeVanillaGroup(key, group, new(GhostWakeCause.NativeFallback, "sleep failed"));
+                return;
             }
+            ThrottleBrain(bot);
             _vanillaDormant.Add(bot);
             _vanillaHpBaseline[bot] = VanillaHp(bot);
             DormantProfileIds.Add(bot.GetPlayer.ProfileId);
+            FinishSpawnProtection(bot);
+            added++;
         }
-        _vanillaGroupSleptAt[key] = Time.time;
+        if (added == 0) return;
+        if (!joining) _vanillaGroupSleptAt[key] = Time.time;
         _windowSleeps++;
-        Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) dormant in place ({_vanillaDormant.Count} vanilla dormant)");
+        if (joining)
+        {
+            Log.Info($"GHOST GROUP JOIN: {added} members joined sleeping group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}); existing Ghost state preserved");
+            return;
+        }
+        Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) dormant {(native ? "with native movement" : "in place")} ({_vanillaDormant.Count} vanilla dormant) policy={(NativeStandardCount(group) > 0 ? "standard" : "default")}");
     }
 
-    private void WakeVanillaGroup(object key, List<BotOwner> group, string reason)
+    private void WakeVanillaGroup(object key, List<BotOwner> group, GhostWakeReason reason)
     {
         for (var i = 0; i < group.Count; i++)
-        {
-            var bot = group[i];
-            _vanillaDormant.Remove(bot);
-            DormantProfileIds.Remove(bot.GetPlayer.ProfileId);
-            _vanillaLastHp[bot] = VanillaHp(bot);
-            if (bot.IsDead) continue;
-            try
-            {
-                bot.gameObject.SetActive(true);
-                bot.PatrollingData.Unpause();
-                bot.PostActivate();
-            }
-            catch (System.Exception e)
-            {
-                Log.Error($"vanilla sleeper {bot.GetPlayer?.Profile?.Nickname} wake recipe failed: {e}");
-            }
-        }
-        _vanillaGroupWokeAt[key] = Time.time;
+            WakeVanillaBot(group[i]);
+        _vanillaSleepAllowedAt[key] = Time.time + reason.CooldownSeconds;
         _windowWakes++;
-        Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) awake: {reason} ({_vanillaDormant.Count} vanilla dormant)");
+        RecordWake(reason.Cause);
+        Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) awake: {reason.Message} ({_vanillaDormant.Count} vanilla dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
+    }
+
+    private bool WakeVanillaBot(BotOwner bot)
+    {
+        if (!_vanillaDormant.Remove(bot)) return false;
+        var native = _nativeGhosts.Remove(bot);
+        UnthrottleBrain(bot);
+        DormantProfileIds.Remove(bot.GetPlayer.ProfileId);
+        _vanillaLastHp[bot] = VanillaHp(bot);
+        // A dead member also needs its body back, but must not reactivate its brain.
+        if (bot.IsDead) { bot.gameObject.SetActive(true); return true; }
+        try
+        {
+            bot.gameObject.SetActive(true);
+            if (!native) bot.PatrollingData.Unpause();
+            bot.PostActivate();
+            if (native) NativeGhostSystem.ResyncAfterWake(bot);
+        }
+        catch (System.Exception e)
+        {
+            Log.Error($"vanilla sleeper {bot.GetPlayer?.Profile?.Nickname} wake recipe failed: {e}");
+        }
+        return true;
     }
 
     private static float VanillaHp(BotOwner bot)
@@ -1926,5 +2594,20 @@ public class DormancySystem
         var hc = bot.GetPlayer?.HealthController;
         if (hc == null || !hc.IsAlive) return 0f;
         return hc.GetBodyPartHealth(EBodyPart.Common, true).Current;
+    }
+
+    public void OnVanillaRemoved(BotOwner bot)
+    {
+        NativePatrolDiagnostics.Forget(bot);
+        var dormant = _vanillaDormant.Remove(bot);
+        _nativeGhosts.Remove(bot);
+        _vanillaHpBaseline.Remove(bot);
+        _vanillaLastHp.Remove(bot);
+        _vanillaHpDropAt.Remove(bot);
+        if (!dormant) return;
+        UnthrottleBrain(bot);
+        DormantProfileIds.Remove(bot.ProfileId);
+        try { if (bot.gameObject != null) bot.gameObject.SetActive(true); }
+        catch { }
     }
 }

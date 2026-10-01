@@ -51,8 +51,8 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
     private const float DispatchGraceSeconds = 2f;
 
     /// <summary>
-    /// Seconds an agent can spend "within the loose 15 m exfil radius but outside the actual trigger
-    /// collider" before we force the despawn from their current position. 15 s gives the bot plenty of
+    /// Seconds without meaningful movement within the loose exfil radius but outside the trigger
+    /// before we force despawn from the current position. Movement renews the timer, allowing
     /// chances to descend a hatch / walk around the entry, but caps the worst case (without it a bot can
     /// sit at the exfil edge for minutes until SAIN combat takes over).
     /// </summary>
@@ -62,7 +62,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
     // and re-picks. Long enough that walking from across the map doesn't trip it.
     private const float StuckEnRouteThresholdSeconds = 30f;
     private const float StuckEnRouteMoveDistSqr = 2f * 2f;
-    private readonly System.Collections.Generic.Dictionary<int, (int locId, Vector3 lastPos, float lastMoveTime)> _stuckEnRouteTracker = new();
+    private readonly System.Collections.Generic.Dictionary<int, (Objective objective, int locId, Vector3 lastPos, float lastMoveTime)> _stuckEnRouteTracker = new();
 
     public override void UpdateScore(int ordinal)
     {
@@ -86,28 +86,21 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                                                           or ObjectiveStatus.Looting
                                                           or ObjectiveStatus.Extracting)
             {
+                _stuckEnRouteTracker.Remove(agent.Id);
                 agent.TaskScores[ordinal] = 0;
                 continue;
             }
 
-            // Baseline 0.5f, boosted to 0.65f as the bot gets nearer. Once within the objective radius,
-            // utility falls off sharply.
+            // Scoring still runs while SAIN owns the bot. Clear here as well as on deactivation:
+            // an internal action may have displaced Goto before the later handover to SAIN.
+            if (!agent.IsActive) _stuckEnRouteTracker.Remove(agent.Id);
+
+            // Keep navigation active until its arrival update validates the objective. A score that
+            // decays to zero at the target can prevent that update or let cover steal the arrival.
             var distSqr = (location.Position - agent.Position).sqrMagnitude;
 
             var utilityBoostFactor = Mathf.InverseLerp(UtilityBoostMaxDistSqr, location.RadiusSqr, distSqr);
-            // Exfil keeps full score inside the arrival radius. The proximity decay exists so the
-            // arrival handover (Loot / Guard) can outbid Goto, but an exfil has no handover: either
-            // the bot gets inside the trigger (status flips to Extracting → score 0 above) or it must
-            // keep pushing in while the outside-trigger force-extract timer runs — and that timer
-            // ticks in Update(), ActiveEntities only. With decay, entering the generous 15 m radius
-            // collapsed the score under GuardAction's in-radius 0.65, Goto deactivated, and the timer
-            // froze forever: a bot would arm the timer at an exfil it couldn't enter, then guard-sweep
-            // beside it until raid end.
-            var utilityDecay = location.Category == WaypointCategory.Exfil
-                ? 1f
-                : Mathf.InverseLerp(0f, location.RadiusSqr, distSqr);
-
-            agent.TaskScores[ordinal] = utilityDecay * (UtilityBase + utilityBoostFactor * UtilityBoost);
+            agent.TaskScores[ordinal] = UtilityBase + utilityBoostFactor * UtilityBoost;
         }
     }
 
@@ -132,7 +125,10 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                     objective.DispatchTime = Time.time;
                     var startDistSqr = (objective.Location.Position - agent.Position).sqrMagnitude;
                     var shouldSprint = ShouldSprintToObjective(agent, startDistSqr);
-                    movementSystem.MoveToByPath(agent, objective.Location.Position, sprint: shouldSprint);
+                    var destination = objective.Location.Category == WaypointCategory.Exfil
+                        ? objective.Location.ExfilInteriorPosition ?? objective.Location.Position
+                        : objective.Location.Position;
+                    movementSystem.MoveToByPath(agent, destination, sprint: shouldSprint);
                     objective.Status = ObjectiveStatus.Moving;
                     break;
                 case ObjectiveStatus.Moving:
@@ -140,6 +136,8 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                         objective.ArrivalPath = agent.Movement.Path;
 
                     var distanceSqr = (objective.Location.Position - agent.Position).sqrMagnitude;
+                    if (objective.Location.Category == WaypointCategory.Exfil && objective.Location.ExfilInteriorPosition is Vector3 insideTarget)
+                        distanceSqr = Mathf.Min(distanceSqr, (insideTarget - agent.Position).sqrMagnitude);
 
                     // Stuck-en-route watchdog. Keys on actual position, NOT Movement.Status, so it catches a
                     // "Moving but not advancing" limbo at an off-navmesh loot spot where the Status-gated
@@ -150,13 +148,14 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                         _stuckEnRouteTracker.Remove(agent.Id);
                     }
                     else if (!_stuckEnRouteTracker.TryGetValue(agent.Id, out var t)
+                             || !ReferenceEquals(t.objective, objective)
                              || t.locId != objective.Location.Id)
                     {
-                        _stuckEnRouteTracker[agent.Id] = (objective.Location.Id, agent.Position, Time.time);
+                        _stuckEnRouteTracker[agent.Id] = (objective, objective.Location.Id, agent.Position, Time.time);
                     }
                     else if ((agent.Position - t.lastPos).sqrMagnitude > StuckEnRouteMoveDistSqr)
                     {
-                        _stuckEnRouteTracker[agent.Id] = (t.locId, agent.Position, Time.time);
+                        _stuckEnRouteTracker[agent.Id] = (objective, t.locId, agent.Position, Time.time);
                     }
                     else if (Time.time - t.lastMoveTime > StuckEnRouteThresholdSeconds)
                     {
@@ -165,8 +164,8 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                         {
                             // Exfils get the 3-strike treatment instead of a one-shot blacklist: a
                             // partial-path trip legitimately stalls where the mesh ends, and conditions can
-                            // change between tries. At 3 strikes TrackArrivalFailure force-despawns near the
-                            // exit or blacklists the exfil.
+                            // change between tries. Keep an available foot exit while local recovery runs;
+                            // the existing proximity fallback still handles a blocked final entrance.
                             objective.Status = ObjectiveStatus.Failed;
                             Log.Info($"{agent} stalled en-route to exfil {objective.Location} for {StuckEnRouteThresholdSeconds:F0}s — registering arrival strike");
                             TrackArrivalFailure(agent, objective.Location);
@@ -175,6 +174,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                         if (agent.Squad != null && !agent.Squad.CompletedPoiIds.Contains(objective.Location.Id))
                         {
                             agent.Squad.CompletedPoiIds.Add(objective.Location.Id);
+                            QuestObjectiveRecovery.Retire(agent.Squad, objective.Location, "stalled approach");
                         }
                         objective.Status = ObjectiveStatus.Failed;
                         Log.Info($"{agent} stuck en-route to {objective.Location} for {StuckEnRouteThresholdSeconds:F0}s without advancing — blacklisted for {agent.Squad}, rerouting");
@@ -218,14 +218,18 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                     }
 
                     var inRadius = false;
+                    var arrivalRefusal = "distance";
                     if (distanceSqr <= objective.Location.RadiusSqr)
                     {
-                        // Dormant ghosts skip the LoS gate: the ray fires from a frozen inactive body and
-                        // can report a wall that isn't there, and a never-acked arrival wedges the squad's
-                        // "all arrived" gate forever (observed on Quest waypoints in the limiter test raid).
-                        // In-radius is truth enough for a ghost — the LoS check exists to stop REAL bots
-                        // validating loot through walls.
-                        if (RequiresArrivalLoSCheck(objective.Location.Category) && !agent.IsDormant)
+                        // Quest arrival uses simulated feet for both awake and sleeping agents. Loot keeps
+                        // its existing head-based gate, skipped while the physical body is inactive.
+                        if (objective.Location.Category == WaypointCategory.Quest)
+                        {
+                            inRadius = agent.QuestArrival.Check(agent.Position, objective.Location.Position, out arrivalRefusal);
+                            if (inRadius) ClearLoSBlockedTracking(agent);
+                            else if (TrackLoSBlocked(agent, objective.Location, arrivalRefusal)) continue;
+                        }
+                        else if (RequiresArrivalLoSCheck(objective.Location.Category) && !agent.IsDormant)
                         {
                             if (HasArrivalLineOfSight(agent, objective.Location.Position))
                             {
@@ -235,6 +239,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                             else
                             {
                                 Log.Debug($"{agent} within {Mathf.Sqrt(distanceSqr):F1}m of {objective.Location} but Physics raycast BLOCKED — wall in between, holding off arrival");
+                                arrivalRefusal = "line-of-sight";
                                 if (TrackLoSBlocked(agent, objective.Location)) continue;
                             }
                         }
@@ -248,19 +253,35 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                              && distanceSqr <= (objective.Location.Category == WaypointCategory.Corpse
                                  ? CorpseNavSnapArrivalRadiusSqr
                                  : NavSnapArrivalRadiusSqr)
-                             && RequiresArrivalLoSCheck(objective.Location.Category)
-                             && HasArrivalLineOfSight(agent, objective.Location.Position))
+                             && RequiresArrivalLoSCheck(objective.Location.Category))
                     {
-                        Log.Debug($"{agent} BSG nav-snap arrival rescue: stopped {Mathf.Sqrt(distanceSqr):F1}m off {objective.Location} but Physics raycast clear → accepting arrival");
-                        inRadius = true;
-                        ClearLoSBlockedTracking(agent);
+                        var arrivalClear = objective.Location.Category == WaypointCategory.Quest
+                            ? agent.QuestArrival.Check(agent.Position, objective.Location.Position, out arrivalRefusal)
+                            : HasArrivalLineOfSight(agent, objective.Location.Position);
+                        if (arrivalClear)
+                        {
+                            Log.Debug($"{agent} BSG nav-snap arrival rescue: stopped {Mathf.Sqrt(distanceSqr):F1}m off {objective.Location}, approach clear, checking target floor");
+                            inRadius = true;
+                            ClearLoSBlockedTracking(agent);
+                        }
+                        else
+                        {
+                            if (objective.Location.Category != WaypointCategory.Quest) arrivalRefusal = "line-of-sight";
+                            ClearLoSBlockedTracking(agent);
+                        }
                     }
                     else
                     {
                         ClearLoSBlockedTracking(agent);
                     }
+                    if (inRadius && !waypointSystem.HasReachedZoneFloor(agent.Squad, objective.Location, agent.Position))
+                    {
+                        inRadius = false;
+                        arrivalRefusal = "floor";
+                    }
                     if (inRadius)
                     {
+                        agent.ArrivalFailures.Forget(objective.Location.Id);
                         // If this is a lootable POI and we can grab the claim, chain straight into Looting
                         // state. Otherwise (claim held, or non-lootable category) fall through to Finished —
                         // the squad waits here and another task can run.
@@ -286,34 +307,33 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                         else if (objective.Location.Category == WaypointCategory.Exfil
                                  && objective.Location.Target is ExfiltrationPoint exfil)
                         {
-                            // The 15 m exfil radius is generous on purpose (BSG nav-snap drift, large
-                            // trigger volumes), but it lets bots "extract" while standing at the surface
-                            // above an underground exfil whose registered transform.position is at the
-                            // hatch but whose actual trigger volume goes below ground. Add a collider-
-                            // contains check so the bot has to be PHYSICALLY inside the trigger volume,
-                            // not just XZ-close. If the bot is outside the volume, keep walking — the
-                            // arrival radius still bounded re-dispatch via TrackArrivalFailure when the
-                            // BSG nav can't get them in (3-fail blacklist still applies, the squad picks
-                            // a different exfil).
-                            if (!IsAgentInsideExfilTrigger(agent, exfil))
+                            if (ExfilArrival.IsSharedTimer(exfil) && ExfilArrival.IsUnavailable(exfil))
                             {
-                                // Bot is within the loose arrival radius but outside the actual trigger
-                                // volume. The TrackArrivalFailure path is fragile here — if the agent
-                                // happens to re-dispatch between misses (sweep, splinter, anything that
-                                // touches LastFailedPoiId) the consecutive counter resets to 1 and never
-                                // reaches the 3-fail force-extract trigger; in practice only 1 arrival
-                                // miss would log, then the bot would stand at the exfil for minutes until
-                                // SAIN combat took over. Replace with a dedicated stuck
-                                // timer: start counting on first miss, force-extract after N s of being
-                                // continuously "within radius + outside trigger". Resets only when the
-                                // agent actually exits the radius or enters the trigger.
-                                if (objective.ExfilOutsideTriggerSince < 0f)
+                                Log.Info($"{agent} V-Ex {exfil.name} unavailable on arrival, selecting another exfil");
+                                ExfilArrival.Abandon(agent, objective.Location);
+                                break;
+                            }
+                            // The loose radius can include the surface above an underground exit.
+                            // Keep walking to the interior target until arrival or a local fallback.
+                            if (!ExfilArrival.IsInside(agent, objective.Location))
+                            {
+                                // Renew the local fallback while making progress, including downstairs.
+                                // If the foot-exit approach stalls, still extract here without choosing
+                                // another exit. Shared-timer cars keep their stricter arrival rules.
+                                var firstWait = objective.ExfilOutsideTriggerSince < 0f;
+                                var outsideWait = ExfilArrival.OutsideTriggerWait(agent);
+                                if (firstWait)
                                 {
-                                    objective.ExfilOutsideTriggerSince = Time.time;
                                     Log.Debug($"{agent} within {Mathf.Sqrt(distanceSqr):F1}m of {objective.Location} but outside the trigger collider — counting as arrival miss (force-extract timer armed)");
                                 }
-                                else if (Time.time - objective.ExfilOutsideTriggerSince >= ExfilOutsideTriggerForceExtractSeconds)
+                                else if (outsideWait >= ExfilOutsideTriggerForceExtractSeconds)
                                 {
+                                    if (ExfilArrival.IsSharedTimer(exfil))
+                                    {
+                                        Log.Info($"{agent} V-Ex {exfil.name} trigger unreachable, selecting another exfil");
+                                        ExfilArrival.Abandon(agent, objective.Location);
+                                        break;
+                                    }
                                     ActivateExfilForBot(exfil, agent);
                                     objective.Status = ObjectiveStatus.Extracting;
                                     objective.ExfilOutsideTriggerSince = -1f;
@@ -368,7 +388,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                              && Time.time - objective.DispatchTime > DispatchGraceSeconds)
                     {
                         objective.Status = ObjectiveStatus.Failed;
-                        Log.Debug($"{agent} stopped outside {objective.Location} arrival radius ({Mathf.Sqrt(distanceSqr):F1}m / {Mathf.Sqrt(objective.Location.RadiusSqr):F1}m) — failing objective to unblock re-dispatch");
+                        Log.Debug($"{agent} stopped outside {objective.Location} arrival radius ({Mathf.Sqrt(distanceSqr):F1}m / {Mathf.Sqrt(objective.Location.RadiusSqr):F1}m), reason={arrivalRefusal} botY={agent.Position.y:F2} targetY={objective.Location.Position.y:F2}: failing objective to unblock re-dispatch");
                         TrackArrivalFailure(agent, objective.Location);
                     }
 
@@ -383,9 +403,12 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
 
     protected override void Deactivate(Agent entity)
     {
-        // Clear the stuck-en-route timer on losing the agent; otherwise a bot held stationary by SAIN
-        // re-enters Goto with a stale timer and wrongly blacklists its POI.
-        _stuckEnRouteTracker.Remove(entity.Id);
+        // Preserve the same target's watchdog across internal action changes. A handover to SAIN
+        // still clears it, so legitimate combat/cover time never counts as an ORBIT navigation stall.
+        if (!entity.IsActive || !dataset.Entities.Values.Contains(entity)
+            || entity.Objective.Status is ObjectiveStatus.Finished or ObjectiveStatus.Failed
+                                                       or ObjectiveStatus.Looting or ObjectiveStatus.Extracting)
+            _stuckEnRouteTracker.Remove(entity.Id);
 
         if (entity.Objective.Status is ObjectiveStatus.Finished or ObjectiveStatus.Failed
                                     or ObjectiveStatus.Looting or ObjectiveStatus.Extracting)
@@ -425,7 +448,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
     /// pinned target so the next dispatch tick picks a new one. Returns true when the blacklist fired and the
     /// caller should skip the rest of the current arrival-resolution branch.
     /// </summary>
-    private static bool TrackLoSBlocked(Agent agent, Waypoint location)
+    private static bool TrackLoSBlocked(Agent agent, Waypoint location, string reason = "line-of-sight")
     {
         if (agent == null || location == null || agent.Squad == null) return false;
         var locId = location.Id;
@@ -437,6 +460,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
         }
         if (Time.time - agent.LoSBlockedSinceTime < LoSBlockedTimeoutSeconds) return false;
         agent.Squad.CompletedPoiIds.Add(locId);
+        QuestObjectiveRecovery.Retire(agent.Squad, location, "blocked arrival");
         if (agent.Squad.Objective.Location != null
             && agent.Squad.Objective.Location.Id == locId)
         {
@@ -445,7 +469,7 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
         agent.Objective.Location = null;
         agent.Objective.SplinterParent = null;
         agent.Objective.Status = ObjectiveStatus.None;
-        Log.Info($"{agent} blacklisting {location} for {agent.Squad} after {LoSBlockedTimeoutSeconds:F0}s of LoS-blocked arrival (target appears to be inside a wall) — cleared agent + squad target to force re-dispatch");
+        Log.Info($"{agent} blacklisting {location} for {agent.Squad} after {LoSBlockedTimeoutSeconds:F0}s of blocked arrival (reason={reason}); cleared agent + squad target to force re-dispatch");
         ClearLoSBlockedTracking(agent);
         return true;
     }
@@ -465,16 +489,11 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
     {
         if (location == null || agent?.Squad == null) return;
         var locId = location.Id;
-        if (agent.LastFailedPoiId == locId)
-        {
-            agent.ConsecutiveSamePoiFailures++;
-        }
-        else
-        {
-            agent.LastFailedPoiId = locId;
-            agent.ConsecutiveSamePoiFailures = 1;
-        }
-        if (agent.ConsecutiveSamePoiFailures >= 3)
+        var distance = Vector3.Distance(agent.Position, location.Position);
+        var strikes = agent.ArrivalFailures.Record(locId, distance, Time.time, out var progress);
+        if (progress >= 20f)
+            Log.Info($"{agent} stopped {distance:F0}m from {location}, {progress:F0}m closer than the previous attempt: progress, arrival strikes reset");
+        if (strikes >= 3)
         {
             // Exfil special case: the squad has already committed to extracting (ExtractRequested set,
             // bee-line in progress). If the bot can't physically enter the trigger volume after 3
@@ -486,16 +505,25 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
                 && location.Target is ExfiltrationPoint exfil
                 && (agent.Squad.ExtractRequested || agent.SoloExtractRequested))
             {
-                // Force the despawn only when the bot made it near the exit (blocked trigger, nav quirk on
-                // the last meters). Far away — a genuinely dead-ended partial path — blacklist this exfil
-                // instead so the next scan picks another; despawning mid-map is never acceptable.
-                if ((agent.Position - location.Position).sqrMagnitude <= ExfilForceDespawnProximitySqr)
+                // Force the despawn only near the exit. A distant local blockage says nothing about
+                // whether the exit is reachable from a nearby NavMesh point.
+                if (!ExfilArrival.IsSharedTimer(exfil)
+                    && (agent.Position - location.Position).sqrMagnitude <= ExfilForceDespawnProximitySqr)
                 {
                     ActivateExfilForBot(exfil, agent);
                     agent.Objective.Status = ObjectiveStatus.Extracting;
                     Log.Info($"{agent} couldn't reach inside of {location} after 3 attempts — forcing extract from current position ({agent.Position}, exfil status={exfil.Status})");
-                    agent.ConsecutiveSamePoiFailures = 0;
-                    agent.LastFailedPoiId = -1;
+                    agent.ArrivalFailures.Forget(locId);
+                    return;
+                }
+                if (exfil.Settings?.ExfiltrationType == EExfiltrationType.Individual
+                    && exfil.Status != EExfiltrationStatus.NotPresent && exfil.Status != EExfiltrationStatus.Hidden)
+                {
+                    // Keep both solo and squad pins. The position-based watchdog survives these short
+                    // retries and can relocate the bot onto a nearby path to this same exit.
+                    agent.Objective.Status = ObjectiveStatus.None;
+                    if (strikes == 3)
+                        Log.Info($"{agent} exfil recovery: keeping {location} despite blocked approach ({distance:F0}m remaining), awaiting local unsticking");
                     return;
                 }
                 Log.Info($"{agent} still {Vector3.Distance(agent.Position, location.Position):F0}m short of {location} after 3 attempts — blacklisting this exfil for {agent.Squad}, re-scanning");
@@ -503,6 +531,12 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
             }
 
             agent.Squad.CompletedPoiIds.Add(locId);
+            QuestObjectiveRecovery.Retire(agent.Squad, location, "repeated arrival failures");
+            if (location.Category == WaypointCategory.Exfil)
+            {
+                ExfilArrival.Abandon(agent, location);
+                Log.Debug($"{agent} exfil recovery: cleared failed exit {location} and selection cache, extraction intent preserved");
+            }
             // Adding to CompletedPoiIds only filters FUTURE picks; the current dispatch still has
             // agent.Objective.Location pinned at the bad POI (set by AssignNewObjective, by a follower
             // splinter pick, or by the loot routine's scavenge sweep which pins squad.Objective.Location at
@@ -517,31 +551,11 @@ public class GotoObjectiveAction(AgentData dataset, MovementSystem movementSyste
             agent.Objective.Location = null;
             agent.Objective.SplinterParent = null;
             agent.Objective.Status = ObjectiveStatus.None;
-            // Record the blacklist firing so the rapid-POI-churn detector can fire the close-doors
-            // remediation when this agent is bouncing across MULTIPLE POIs (the per-POI 3-fail counter
-            // alone never catches that pattern — it resets when the agent switches POIs).
+            // Keep the existing door remediation informed when multiple destinations fail locally.
             movementSystem.RegisterPoiBlacklistAndMaybeCloseDoors(agent);
-            Log.Info($"{agent} blacklisting {location} for {agent.Squad} after 3 consecutive arrival failures (cleared agent + squad target to force re-dispatch)");
-            agent.ConsecutiveSamePoiFailures = 0;
-            agent.LastFailedPoiId = -1;
+            Log.Info($"{agent} blacklisting {location} for {agent.Squad} after 3 arrival failures (cleared agent + squad target to force re-dispatch)");
+            agent.ArrivalFailures.Forget(locId);
         }
-    }
-
-    /// <summary>
-    /// True when the agent is physically inside the exfil's trigger collider bounds (or no collider is
-    /// available, in which case we fall back to the existing radius check upstream). Catches the case
-    /// where the registered transform.position is at the surface but the actual trigger volume is below
-    /// ground (or vice versa): the bot would otherwise extract from outside the real zone.
-    /// </summary>
-    private static bool IsAgentInsideExfilTrigger(Agent agent, ExfiltrationPoint exfil)
-    {
-        var collider = exfil?.GetComponent<Collider>();
-        if (collider == null) return true; // can't verify → defer to the existing radius check
-        var pos = agent.Position;
-        // Bounds.Contains is AABB which is loose for rotated colliders, but exfil triggers are usually
-        // axis-aligned BoxColliders so this is exact enough. Closer-point would be more precise but
-        // costs more and isn't worth it for ~5-15 m volumes.
-        return collider.bounds.Contains(pos);
     }
 
     // Mirrors BSG's ActivateExfil flow: forces a still-gated exfil into a usable state right when the bot

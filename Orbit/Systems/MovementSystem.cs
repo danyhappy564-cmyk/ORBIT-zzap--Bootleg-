@@ -16,7 +16,7 @@ namespace Orbit.Systems;
 /// path-deviation steering, door handling, sprint gating, and the two-stage stuck-detection / remediation
 /// pipeline (soft = vault/jump, hard = re-path then teleport).
 /// </summary>
-public class MovementSystem
+public partial class MovementSystem
 {
     private const float TargetEps = 1.5f;
     private const float TargetEpsSqr = TargetEps * TargetEps;
@@ -25,17 +25,19 @@ public class MovementSystem
     private const int RetryLimit = 10;
 
     private readonly NavJobExecutor _navJobExecutor;
-    private readonly Queue<ValueTuple<Agent, NavJob>> _moveJobs;
+    private readonly Queue<(Agent Agent, NavJob Job, int Revision)> _moveJobs;
     private readonly StuckRemediation _stuckRemediation;
     private readonly List<Player> _humanPlayers;
     private readonly WaypointSystem _waypointSystem;
+    private readonly DoorSystem _doorSystem;
     private readonly NavMeshPath _rescuePath = new();
     private readonly List<Waypoint> _wpScratch = new();
 
-    public MovementSystem(NavJobExecutor navJobExecutor, List<Player> humanPlayers, WaypointSystem waypointSystem)
+    public MovementSystem(NavJobExecutor navJobExecutor, List<Player> humanPlayers, WaypointSystem waypointSystem, DoorSystem doorSystem)
     {
+        _doorSystem = doorSystem;
         _navJobExecutor = navJobExecutor;
-        _moveJobs = new Queue<(Agent, NavJob)>(20);
+        _moveJobs = new Queue<(Agent, NavJob, int)>(20);
         _stuckRemediation = new StuckRemediation(this, humanPlayers);
         _humanPlayers = humanPlayers;
         _waypointSystem = waypointSystem;
@@ -43,27 +45,11 @@ public class MovementSystem
 
     public void Update(List<Agent> liveAgents)
     {
+        _recoveryAgents = liveAgents;
         TickDoorOpenWatches();
+        TickGhostPendingDoors();
 
-        if (_moveJobs.Count > 0)
-        {
-            for (var i = 0; i < _moveJobs.Count; i++)
-            {
-                var (agent, job) = _moveJobs.Dequeue();
-
-                if (!job.IsReady)
-                {
-                    _moveJobs.Enqueue((agent, job));
-                    continue;
-                }
-
-                // Discard the move job if the agent is inactive (mod deactivated, bot died, etc).
-                if (!agent.IsActive)
-                    continue;
-
-                StartMovement(agent, job);
-            }
-        }
+        ProcessMoveJobs();
 
         for (var i = 0; i < liveAgents.Count; i++)
         {
@@ -71,8 +57,11 @@ public class MovementSystem
 
             if (!agent.IsActive)
             {
-                if (agent.Movement.HasPath)
-                    ResetPath(agent);
+                agent.Stuck.IdleRescueSince = -1f;
+                agent.Stuck.IdleRescueIntent = false;
+                agent.Stuck.LocalEscape.Reset();
+                agent.Stuck.Recovery.Suspend();
+                ResetPath(agent);
                 continue;
             }
 
@@ -81,28 +70,29 @@ public class MovementSystem
             // (world keeps moving); everything else waits for the wake resync in DormancySystem.
             if (agent.IsDormant)
             {
-                // Pinned while a simulated ghost fight plays out — nobody walks their route mid-firefight.
-                if (agent.Squad != null && Time.time < agent.Squad.GhostFightUntil) continue;
+                agent.Stuck.Recovery.Suspend();
+                // Pinned while a simulated ghost fight plays out: nobody walks their route mid-firefight.
+                if (agent.Squad != null && Time.time < agent.Squad.GhostFightUntil)
+                {
+                    agent.Stuck.IdleRescueSince = -1f;
+                    agent.Stuck.IdleRescueIntent = false;
+                    agent.Stuck.LocalEscape.Reset();
+                    continue;
+                }
+                // The island rescues run for sleepers too. A ghost that spawned on a disconnected chunk only
+                // ever gets PathPartial (Unity paths to the closest point of its island, never PathInvalid),
+                // so the invalid-path streak rescue never fires; a bot that fell asleep within seconds of
+                // spawning used to sit in that room for the whole raid (Streets, Gipphe). Both rescues move
+                // the body through Player.Teleport, which the wake resync already uses on inactive bodies.
+                TryIdleIslandRescue(agent);
+                TrySpawnIslandRescue(agent, liveAgents);
                 if (DormancySystem.GhostMovementEnabled)
                     GhostFollowPath(agent);
                 continue;
             }
 
-            // Keep BSG's BotMover anchored to where the bot ACTUALLY is. BotMover.CastFromPos (the hard rescue
-            // teleport) snaps the bot to _lastGoodCastPoint when it decides the bot is stuck. The brain layer
-            // sets _lastGoodCastPoint to agent.Position only at the layer *transition* — so while we're in
-            // control, it stays frozen at wherever the bot was when handed off. A rescue then yeets the bot
-            // back to that stale anchor (sometimes their spawn). Refreshing every frame makes any rescue land
-            // as a teleport-to-self no-op.
-            var mover = agent.Bot?.Mover;
-            if (mover != null)
-            {
-                var pos = agent.Position;
-                mover._lastGoodCastPoint = pos;
-                mover._prevSuccessLinkedFrom = pos;
-                mover._prevLinkPos = pos;
-                mover.PositionOnWayInner = pos;
-            }
+            if (agent.Stuck.Recovery.Observe(agent.Position, agent.Bot?.Mover))
+                TryReturnToValidatedAnchor(agent);
 
             // Runs before UpdateMovement: an islanded bot has no path, so UpdateMovement early-returns and the
             // stuck remediation never sees it.
@@ -110,6 +100,34 @@ public class MovementSystem
             TrySpawnIslandRescue(agent, liveAgents);
 
             UpdateMovement(agent);
+        }
+    }
+
+    private void ProcessMoveJobs()
+    {
+        if (_moveJobs.Count > 0)
+        {
+            var pendingCount = _moveJobs.Count;
+            for (var i = 0; i < pendingCount; i++)
+            {
+                var (agent, job, revision) = _moveJobs.Dequeue();
+
+                if (!agent.IsActive) continue;
+                if (revision != agent.Movement.PathRevision)
+                {
+                    Log.Debug($"{agent} path job discarded: obsolete revision={revision} current={agent.Movement.PathRevision} ready={job.IsReady} origin={job.Origin} target={job.Target}");
+                    continue;
+                }
+
+                if (!job.IsReady)
+                {
+                    _moveJobs.Enqueue((agent, job, revision));
+                    continue;
+                }
+
+                StartMovement(agent, job);
+                TrackGhostPathInvalid(agent, job);
+            }
         }
     }
 
@@ -138,9 +156,11 @@ public class MovementSystem
 
         // Set the target up-front so callers' "is the target current?" checks see the new value immediately.
         agent.Movement.Target = destination;
+        // Origin recovery can use a corner of the previous path. Scheduling supersedes older jobs;
+        // clearing the path afterwards must retain the new request's revision.
         ScheduleMoveJob(agent, destination);
+        ResetPath(agent, MovementStatus.Moving, invalidatePending: false);
         ResetGait(agent, pose, speed, prone, sprint, urgency);
-        ResetPath(agent, MovementStatus.Moving);
         agent.Movement.Retry = 0;
     }
 
@@ -193,7 +213,38 @@ public class MovementSystem
         }
 
         var job = _navJobExecutor.Submit(origin, destination);
-        _moveJobs.Enqueue((agent, job));
+        _moveJobs.Enqueue((agent, job, ++agent.Movement.PathRevision));
+    }
+
+    private const int GhostInvalidPathRescueStreak = 3;
+
+    /// <summary>
+    /// A ghost parked on a navmesh patch cut off by the danger-zone carvers (or on an islanded chunk) gets
+    /// PathInvalid on every request, and the awake-bot rescues never see it: the hard-stuck machine needs a
+    /// path to time out, and the idle-island watchdog re-arms every time the action flips to guard-in-place
+    /// (Woods raid: AdeknieJadek, 15 minutes of Failed / guard / Failed). Three invalid paths in a row from
+    /// the same spot: move the inactive body to a connected point, the same way the island rescues do.
+    /// </summary>
+    private void TrackGhostPathInvalid(Agent agent, NavJob job)
+    {
+        if (!agent.IsDormant) return;
+        var stuck = agent.Stuck;
+        if (job.Status != NavMeshPathStatus.PathInvalid)
+        {
+            stuck.GhostInvalidPathStreak = 0;
+            return;
+        }
+        if (++stuck.GhostInvalidPathStreak < GhostInvalidPathRescueStreak) return;
+        stuck.GhostInvalidPathStreak = 0;
+        if (!stuck.Recovery.ProbeDue(agent.Position)) return;
+        var from = agent.Position;
+        var nearby = TryNearbyEscape(agent, job.Target, out var localDest);
+        if (nearby == EscapeResult.Pending) return;
+        if (nearby == EscapeResult.Found) { CompleteNearbyEscape(agent, localDest); return; }
+        if (RescueTeleportToConnectedPoint(agent, job.Target) || RescueTeleportNearSquadmate(agent))
+            Log.Info($"{agent} ghost rescue: {GhostInvalidPathRescueStreak} invalid paths in a row from {from}, body moved to a connected navmesh point");
+        else
+            Log.Warning($"{agent} ghost rescue: {GhostInvalidPathRescueStreak} invalid paths in a row from {from} and no rescue point found");
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -218,25 +269,95 @@ public class MovementSystem
         }
     }
 
-    /// <summary>Walking speed used by the dormant ghost follower (m/s), roughly EFT walk pace.</summary>
-    private const float GhostWalkSpeed = 1.9f;
+    // Ghost gait, aligned on what awake bots actually do. Measured on RaidReview position data (4 raids,
+    // moving samples only): a full-speed walk clusters at 2.5-3.0 m/s (scav median 2.74), a sprint at
+    // 5.0-5.5 m/s (PMC p90-p97 5.3-5.4). The old flat 1.9 m/s made every ghost a third slower than a
+    // walking bot and erased the personalities: a GigaChad ghost travelled like a Timmy.
+    private const float GhostWalkSpeed = 2.8f;
+    private const float GhostSprintSpeed = 5.3f;
+    private const float GhostCrouchSpeedMul = 0.5f;
+    private const float GhostSprintBurstSeconds = 14f;   // stamina stand-in: a sleeper's Physical does not tick
+    private const float GhostSprintRecoverSeconds = 10f; // time to refill a fully drained burst
+    private const float GhostIndoorCheckInterval = 1f;
+    private const float GhostRoofCheckHeight = 12f;
+
+    /// <summary>Speed of the ghost follower this frame. The gait INTENT is the live one: the actions keep
+    /// setting movement.Sprint / Speed / Pose for a sleeper exactly as for an awake bot (scavs and Timmies
+    /// never sprint, PMCs sprint when far and walk the final approach, a GigaChad sprints all the way).</summary>
+    private float GhostSpeed(Agent agent)
+    {
+        var movement = agent.Movement;
+        var crouched = movement.Pose < 0.5f;
+        var sprinting = GhostUpdateSprint(agent, movement.Sprint && !crouched);
+        if (sprinting) return GhostSprintSpeed;
+        var speed = GhostWalkSpeed * Mathf.Clamp(movement.Speed, 0.1f, 1f);
+        return crouched ? speed * GhostCrouchSpeedMul : speed;
+    }
+
+    // Same gates as CanSprint for a live body, with stand-ins for what an inactive body cannot report: the
+    // environment id is frozen at sleep time (a throttled roof ray replaces it: no running indoors) and the
+    // stamina does not tick (a burst / recovery budget replaces it). Twisty paths are walked, as awake.
+    private bool GhostUpdateSprint(Agent agent, bool wantsSprint)
+    {
+        var movement = agent.Movement;
+        var allowed = wantsSprint && !movement.GhostExhausted;
+        if (allowed)
+        {
+            if (Time.time >= movement.NextGhostIndoorCheck)
+            {
+                movement.NextGhostIndoorCheck = Time.time + GhostIndoorCheckInterval;
+                movement.GhostIndoors = Physics.Raycast(agent.Position + Vector3.up * 1.6f, Vector3.up,
+                    GhostRoofCheckHeight, TeleportVisLayerMask.value);
+            }
+            if (movement.GhostIndoors) allowed = false;
+        }
+        if (allowed)
+        {
+            var jitterLimit = movement.Urgency switch
+            {
+                MovementUrgency.High => 45f,
+                MovementUrgency.Low => 20f,
+                _ => 30f
+            };
+            if (PathHelper.CalculatePathAngleJitter(movement.Path, movement.CurrentCorner, 10f) >= jitterLimit) allowed = false;
+        }
+
+        if (allowed)
+        {
+            movement.GhostStamina -= Time.deltaTime;
+            if (movement.GhostStamina <= 0f)
+            {
+                movement.GhostStamina = 0f;
+                movement.GhostExhausted = true; // walk until most of the burst is back
+            }
+            return true;
+        }
+
+        movement.GhostStamina = Mathf.Min(GhostSprintBurstSeconds,
+            movement.GhostStamina + Time.deltaTime * GhostSprintBurstSeconds / GhostSprintRecoverSeconds);
+        if (movement.GhostExhausted && movement.GhostStamina >= GhostSprintBurstSeconds * 0.6f)
+            movement.GhostExhausted = false;
+        return false;
+    }
 
     /// <summary>
     /// Path-following for a dormant bot: the disabled GameObject's transform is still drivable, so advance
-    /// it along the computed navmesh corners at walking speed. No steering, no doors (the body phases
-    /// through closed ones — nobody is within sight range by construction), no stuck machinery (a ghost
-    /// can't wedge). Completion mirrors UpdateMovement's last-corner branch so the action layer sees the
-    /// same Stopped/retry outcomes it would from a live walk.
+    /// it along the computed navmesh corners at walking speed. No steering, no stuck machinery (a ghost
+    /// can't wedge). Doors on the heading are unlocked / opened world-side by <see cref="GhostHandleDoors"/>
+    /// so the ghost leaves the map in the state a live walk would (nobody is within sight range by
+    /// construction, so no hands animation is needed). Completion mirrors UpdateMovement's last-corner
+    /// branch so the action layer sees the same Stopped/retry outcomes it would from a live walk.
     /// </summary>
     private void GhostFollowPath(Agent agent)
     {
         var movement = agent.Movement;
+        if (Time.time < movement.DoorInteractHoldUntil) return;
         if (!movement.HasPath || movement.Status != MovementStatus.Moving)
             return;
 
         var transform = agent.Player.Transform;
         var pos = transform.position;
-        var step = GhostWalkSpeed * Time.deltaTime;
+        var step = GhostSpeed(agent) * Time.deltaTime;
 
         var corner = movement.Path[movement.CurrentCorner];
         var toCorner = corner - pos;
@@ -267,7 +388,223 @@ public class MovementSystem
             return;
         }
 
-        transform.position = pos + toCorner * (step / dist);
+        var next = pos + toCorner * (step / dist);
+        if (Orbit.Navigation.DangerZones.IsInside(next))
+        {
+            SkipGhostDangerSegment(agent, movement, next);
+            return;
+        }
+        GhostHandleDoors(agent, pos, toCorner / dist);
+        transform.position = next;
+    }
+
+    // The carvers keep paths out of minefields and sniper zones, but the trigger volumes are wider than the
+    // carve boxes and a corner-to-corner segment can still clip one. BSG's AvoidDanger layer then hijacks the
+    // sleeper (it cannot run, the body is inactive) and the ghost freezes for good. Jump ahead to the first
+    // corner clear of every zone instead; nobody is within sight range of a ghost by construction.
+    private void SkipGhostDangerSegment(Agent agent, Movement movement, Vector3 blocked)
+    {
+        for (var i = movement.CurrentCorner; i < movement.Path.Length; i++)
+        {
+            var corner = movement.Path[i];
+            if (Orbit.Navigation.DangerZones.IsInside(corner)) continue;
+            Log.Debug($"{agent} ghost walk clipped a danger zone at {blocked}: jumped {Vector3.Distance(agent.Position, corner):F0}m to corner {i}");
+            agent.Player.Transform.position = corner;
+            movement.CurrentCorner = Mathf.Min(i + 1, movement.Path.Length - 1);
+            return;
+        }
+        Log.Debug($"{agent} ghost walk: every remaining corner sits in a danger zone, dropping the path");
+        ResetPath(agent, MovementStatus.Failed);
+    }
+
+    // Sleeping bodies cannot drive doors. Search nearby candidates through a two-second spatial cache,
+    // then check only that short list along the route. Door-owned unlock/open coroutines keep running.
+    private const float GhostDoorCheckInterval = 0.25f;
+    private const float GhostDoorScanRadiusSqr = 3f * 3f;
+    private const float GhostDoorLookahead = 2.5f;
+    private const float GhostDoorBoundsPadding = 0.25f;
+    private const float GhostUnlockTimeoutSeconds = 4f;
+    private const float GhostOpenTimeoutSeconds = 3f;      // swing never started (leaf angle unchanged)
+    private const float GhostSwingTimeoutSeconds = 10f;    // swing started but never settled to Open
+    private const float GhostSwingAngleEpsilon = 1f;       // degrees: leaf moved => BSG's coroutine is running
+
+    private enum GhostDoorStage { AwaitUnlock, AwaitOpen }
+
+    private struct GhostPendingDoor
+    {
+        public Door Door;
+        public Agent Agent;
+        public float Deadline;
+        public GhostDoorStage Stage;
+        public float StartAngle;
+        public ulong DoorRevision;
+    }
+
+    private readonly List<GhostPendingDoor> _ghostPendingDoors = new();
+
+    private void GhostHandleDoors(Agent agent, Vector3 pos, Vector3 dir)
+    {
+        if (_doorSystem == null) return;
+        if (!(dir.sqrMagnitude > 0.5f)) return; // degenerate step (paused frame): no heading to scan along
+        var movement = agent.Movement;
+        if (Time.time < movement.NextGhostDoorCheck) return;
+        movement.NextGhostDoorCheck = Time.time + GhostDoorCheckInterval;
+
+        var doors = movement.GhostDoors.Get(_doorSystem, pos);
+        var ray = new Ray(pos, dir);
+        for (var i = 0; i < doors.Count; i++)
+        {
+            var door = doors[i];
+            if (door == null) continue;
+            var state = door.DoorState;
+            if (state != EDoorState.Locked && state != EDoorState.Shut) continue; // open or mid-swing: passable
+            if ((door.transform.position - pos).sqrMagnitude > GhostDoorScanRadiusSqr) continue;
+            var collider = door.Collider;
+            if (collider == null) continue;
+            // "Crossing" = the leaf's bounds sit on the ghost's heading within a short lookahead (or the ghost is
+            // already inside them). Doors merely brushed past in a corridor are left alone.
+            var bounds = collider.bounds;
+            bounds.Expand(GhostDoorBoundsPadding);
+            if (!bounds.Contains(pos) && !(bounds.IntersectRay(ray, out var hitDist) && hitDist <= GhostDoorLookahead)) continue;
+            if (!door.enabled || !door.Operatable || door.InteractingPlayer != null) continue;
+            if (IsGhostDoorPending(door)) continue;
+
+            if (state == EDoorState.Locked) GhostUnlockDoor(agent, door);
+            else GhostOpenDoor(agent, door, "on its route", respectCooldown: true);
+        }
+    }
+
+    private bool IsGhostDoorPending(Door door)
+    {
+        for (var i = 0; i < _ghostPendingDoors.Count; i++)
+            if (_ghostPendingDoors[i].Door == door) return true;
+        return false;
+    }
+
+    private void GhostUnlockDoor(Agent agent, Door door)
+    {
+        var doorId = door.GetInstanceID();
+        // Same gate as the live walker: only PMCs carry keys, and only a door ORBIT routed the squad behind
+        // (force-unlock granted at pick time / carver opened) may be unlocked. Anything else stays locked and the
+        // ghost phases through as before.
+        var role = agent.Bot?.Profile?.Info?.Settings?.Role;
+        if (!role.HasValue || !role.Value.IsPMC()) return;
+        if (!((agent.Squad != null && agent.Squad.ForceUnlockDoorIds.Contains(doorId)) || DoorNavMesh.IsCarverOpened(doorId))) return;
+        if (_doorInteractCooldown.TryGetValue(doorId, out var last) && Time.time - last < DoorInteractCooldownSeconds) return;
+        try
+        {
+            door.Unlock(); // latch coroutine on the door object: DoorState flips to Shut once the lock handle finishes
+            Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Unlock);
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"{agent} ghost unlock on {door.Id} threw (non-fatal): {e.Message}");
+            return;
+        }
+        _doorInteractCooldown[doorId] = Time.time;
+        _ghostPendingDoors.Add(new GhostPendingDoor { Door = door, Agent = agent, Deadline = Time.time + GhostUnlockTimeoutSeconds, Stage = GhostDoorStage.AwaitUnlock, DoorRevision = Orbit.Api.OrbitDoorEvents.Revision(door) });
+        Log.Info($"{agent} ghost unlocked door {door.Id} on its route (no key animation, body asleep)");
+    }
+
+    private void GhostOpenDoor(Agent agent, Door door, string why, bool respectCooldown)
+    {
+        var doorId = door.GetInstanceID();
+        if (door.DoorState != EDoorState.Shut) return;
+        if (respectCooldown && _doorInteractCooldown.TryGetValue(doorId, out var last) && Time.time - last < DoorInteractCooldownSeconds) return;
+        try
+        {
+            // The door drives its own swing (leaf animation + open sound) and settles to Open by itself; a
+            // bot-driven interaction never finalises but this is the door's own routine, not the bot's.
+            door.Open();
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"{agent} ghost open on {door.Id} threw ({e.Message}), snapping the leaf open");
+            SnapDoorOpen(door);
+        }
+        _doorInteractCooldown[doorId] = Time.time;
+        _ghostPendingDoors.Add(new GhostPendingDoor { Door = door, Agent = agent, Deadline = Time.time + GhostOpenTimeoutSeconds, Stage = GhostDoorStage.AwaitOpen, StartAngle = door.CurrentAngle, DoorRevision = Orbit.Api.OrbitDoorEvents.Revision(door) });
+        Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Open);
+        Log.Info($"{agent} ghost opened door {door.Id} {why}");
+    }
+
+    /// <summary>Same settle as the DoorWatch finaliser: state, leaf angle, interaction-result event.</summary>
+    private static void SnapDoorOpen(Door door)
+    {
+        try
+        {
+            door.DoorState = EDoorState.Open;
+            door.CurrentAngle = door.GetAngle(EDoorState.Open);
+            EFT.GlobalEvents.GlobalEventsController.CreateEvent<EFT.GlobalEvents.InteractiveObjectInteractionResultEvent>()
+                .Invoke(door, EDoorState.Open);
+            Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Finalize);
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"ghost door snap-open on {door.Id} failed: {e.Message}");
+        }
+    }
+
+    private void TickGhostPendingDoors()
+    {
+        if (_ghostPendingDoors.Count == 0) return;
+        var now = Time.time;
+        for (var i = _ghostPendingDoors.Count - 1; i >= 0; i--)
+        {
+            var pending = _ghostPendingDoors[i];
+            var door = pending.Door;
+            if (door == null || pending.DoorRevision != Orbit.Api.OrbitDoorEvents.Revision(door))
+            {
+                _ghostPendingDoors.RemoveAt(i);
+                continue;
+            }
+            var state = door.DoorState;
+            switch (pending.Stage)
+            {
+                case GhostDoorStage.AwaitUnlock:
+                    if (state == EDoorState.Shut)
+                    {
+                        // Latch released: swing it open right away (no cooldown, this is our own sequence).
+                        _ghostPendingDoors.RemoveAt(i);
+                        GhostOpenDoor(pending.Agent, door, "after unlocking it", respectCooldown: false);
+                    }
+                    else if (state == EDoorState.Open || (state == EDoorState.Interacting && now > pending.Deadline))
+                    {
+                        _ghostPendingDoors.RemoveAt(i); // someone else opened it, or a swing is already running
+                    }
+                    else if (now > pending.Deadline)
+                    {
+                        Log.Debug($"{pending.Agent} ghost unlock on door {door.Id}: still {state} after {GhostUnlockTimeoutSeconds:F0}s, giving up");
+                        _ghostPendingDoors.RemoveAt(i);
+                    }
+                    break;
+                case GhostDoorStage.AwaitOpen:
+                    if (state == EDoorState.Open)
+                    {
+                        Log.Debug($"{pending.Agent} ghost door {door.Id} swung open (BSG animation settled)");
+                        _ghostPendingDoors.RemoveAt(i);
+                    }
+                    else if (Mathf.Abs(Mathf.DeltaAngle(door.CurrentAngle, pending.StartAngle)) > GhostSwingAngleEpsilon)
+                    {
+                        // Leaf is moving: BSG's swing coroutine owns the door (DoorState flips to Open only at its
+                        // end). Wait for it, snap only if it hangs.
+                        if (now > pending.Deadline + GhostSwingTimeoutSeconds)
+                        {
+                            Log.Debug($"{pending.Agent} ghost open on door {door.Id}: swing started but state still {state} after {GhostOpenTimeoutSeconds + GhostSwingTimeoutSeconds:F0}s, snapping open");
+                            SnapDoorOpen(door);
+                            _ghostPendingDoors.RemoveAt(i);
+                        }
+                    }
+                    else if (now > pending.Deadline)
+                    {
+                        // Leaf never moved: Open() was refused by BSG's interaction gate. Settle it by hand.
+                        Log.Debug($"{pending.Agent} ghost open on door {door.Id}: swing never started, state {state} after {GhostOpenTimeoutSeconds:F0}s, snapping open");
+                        SnapDoorOpen(door);
+                        _ghostPendingDoors.RemoveAt(i);
+                    }
+                    break;
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -372,6 +709,7 @@ public class MovementSystem
                 }
 
                 Log.Debug($"{agent} movement destination reached");
+                agent.Stuck.Hard.RescueStreak = 0;
                 // Don't reset the target — it hasn't changed, we just reached it.
                 ResetPath(agent);
                 return;
@@ -462,6 +800,7 @@ public class MovementSystem
         public Vector3 DoorPos;
         public float InitDistance;
         public string Kind;
+        public ulong DoorRevision;
     }
 
     private const float DoorWatchTimeoutSeconds = 3f;
@@ -483,11 +822,25 @@ public class MovementSystem
             DoorPos = doorPos,
             InitDistance = initDist,
             Kind = kind,
+            DoorRevision = Orbit.Api.OrbitDoorEvents.Revision(door),
         };
         Log.Info($"DoorWatch: {agent} initiated {kind} on door Id={door.Id} (state={door.DoorState}, dist={initDist:F1}m)");
     }
 
     private readonly List<long> _doorWatchRemoveBuffer = new();
+
+    internal void PrepareGhostDoorHandoff(Agent agent)
+    {
+        foreach (var watch in _pendingDoorOpens.Values)
+        {
+            if (watch.Agent != agent || watch.Door == null) continue;
+            // The body animation is already complete (sleep gate). DoorWatch runs outside the body
+            // and still owns local finalisation. Retain its remaining hold while asleep.
+            agent.Movement.DoorInteractHoldUntil = Mathf.Max(agent.Movement.DoorInteractHoldUntil,
+                watch.RequestedAtTime + DoorWatchTimeoutSeconds);
+            Log.Info($"{agent} door handoff to Ghost: id={watch.Door.Id} existing interaction retained");
+        }
+    }
 
     private void TickDoorOpenWatches()
     {
@@ -497,7 +850,8 @@ public class MovementSystem
         foreach (var kv in _pendingDoorOpens)
         {
             var watch = kv.Value;
-            if (watch.Door == null || watch.Agent == null)
+            if (watch.Door == null || watch.Agent == null
+                || watch.DoorRevision != Orbit.Api.OrbitDoorEvents.Revision(watch.Door))
             {
                 _doorWatchRemoveBuffer.Add(kv.Key);
                 continue;
@@ -532,21 +886,6 @@ public class MovementSystem
             {
                 try
                 {
-                    // Fika: host-side state writes don't replicate (no door-state streaming) — route the
-                    // open through the bot's FikaPlayer.ExecuteInteraction override so its WorldInteractionPacket
-                    // makes every client replay it locally. Locked-origin doors (Kind=Unlock) go out as
-                    // Breach, the only interaction a client-side Locked door executes without a key.
-                    // ExecuteInteraction first, snap last: its host-side re-execution can transiently bounce the
-                    // state.
-                    if (Orbit.Helpers.FikaDetection.FikaLoaded
-                        && watch.Agent?.Player != null
-                        && watch.Agent.Bot?.HealthController is { IsAlive: true })
-                    {
-                        var netType = watch.Kind == "Unlock" ? EInteractionType.Breach : EInteractionType.Open;
-                        watch.Agent.Player.ExecuteInteraction(watch.Door, new InteractionResult(netType));
-                        Log.Debug($"DoorWatch: replicated {netType} on door Id={watch.Door.Id} to Fika clients via {watch.Agent}");
-                    }
-
                     watch.Door.DoorState = EDoorState.Open;
                     // Physically snap the leaf to its open pose: on headless the BSG open animation never
                     // runs for bot interactions, leaving state Open with a visually shut leaf (and the
@@ -555,6 +894,7 @@ public class MovementSystem
                     watch.Door.CurrentAngle = watch.Door.GetAngle(EDoorState.Open);
                     EFT.GlobalEvents.GlobalEventsController.CreateEvent<EFT.GlobalEvents.InteractiveObjectInteractionResultEvent>()
                         .Invoke(watch.Door, EDoorState.Open);
+                    Orbit.Api.OrbitDoorEvents.Raise(watch.Door, Orbit.Api.OrbitDoorEvents.Operation.Finalize);
                     Log.Debug($"DoorWatch: finalized door Id={watch.Door.Id} Interacting → Open after {watch.Kind} window (bot interactions never finalize door state) — leaf snapped open");
                 }
                 catch (System.Exception e)
@@ -668,6 +1008,7 @@ public class MovementSystem
                     // interact cooldown so OpenDoor finishes the open before we release path-following.
                     agent.Movement.DoorInteractHoldUntil = Time.time + DoorInteractCooldownSeconds + DoorInteractHoldSeconds;
                     Log.Debug($"{agent} unlocked {door.Id} on arrival (was Locked, ORBIT carver-opened) — holding {DoorInteractCooldownSeconds + DoorInteractHoldSeconds:F1}s for unlock+open, no phase-through");
+                    Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Unlock);
                     StartDoorWatch(agent, door, "Unlock");
                     continue; // next tick: door is Shut → normal Open path runs
                 }
@@ -735,6 +1076,7 @@ public class MovementSystem
                 return false;
             }
             player.ExecuteInteraction(door, gstruct.Value);
+            Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Open);
             // Set collision-pass AFTER ExecuteInteraction so the door's animation can drive the bot's traversal
             // through the swing arc. Order matters: setting it before ExecuteInteraction lets the bot rush the
             // collider before the animation has actually started.
@@ -880,6 +1222,7 @@ public class MovementSystem
                 {
                     door.DoorState = EDoorState.Shut;
                 }
+                Orbit.Api.OrbitDoorEvents.Raise(door, Orbit.Api.OrbitDoorEvents.Operation.Close);
             }
             catch (System.Exception e)
             {
@@ -983,8 +1326,10 @@ public class MovementSystem
     private const float DoorColliderRayLength = 1.5f;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ResetPath(Agent agent, MovementStatus status = MovementStatus.Stopped)
+    private static void ResetPath(Agent agent, MovementStatus status = MovementStatus.Stopped, bool invalidatePending = true)
     {
+        // A queued result belongs to the old route even if the executor finishes after this reset.
+        if (invalidatePending) agent.Movement.PathRevision++;
         // Explicitly DON'T reset the target — it hasn't changed. Only the path is supposed to be deleted.
         agent.Movement.Path = null;
         agent.Movement.Status = status;
@@ -1071,11 +1416,10 @@ public class MovementSystem
     // A bot on a navmesh chunk disconnected from the map can never path to its objective and the stuck
     // remediation never sees it (UpdateMovement early-returns with no path). This watchdog runs regardless of
     // path state: a bot far from its objective that hasn't moved for a window gets one teleport to the nearest
-    // navmesh point connected to that objective. One-shot per bot so it can't loop.
+    // navmesh point connected to that objective. Recent rescue areas are avoided on subsequent attempts.
 
     private const float IdleRescueNoMoveRadiusSqr = 3f * 3f;
     private const float IdleRescueThresholdSeconds = 25f;
-    private const float IdleRescueMinObjectiveDistSqr = 12f * 12f;
     private static readonly float[] IdleRescueRingRadii = { 4f, 8f, 16f, 28f, 45f };
 
     // ── Spawn-island rescue thresholds ──
@@ -1088,48 +1432,164 @@ public class MovementSystem
     private void TryIdleIslandRescue(Agent agent)
     {
         var stuck = agent.Stuck;
-        if (stuck.IdleRescued) return;
-
-        // Only rescue a bot actively trying to REACH its objective. A guarding bot (Status == Finished) sits
-        // deliberately still, often far from a wide anchor's centre; teleporting it would yank it off its post.
-        if (agent.Objective?.Status != ObjectiveStatus.Moving)
+        // Observe the body every active tick, independently of which failing objective is selected.
+        // A gap in these observations means combat, a Ghost fight or inactive control, not travel time.
+        if (stuck.IdleRescueLastObservedAt < 0f || Time.time - stuck.IdleRescueLastObservedAt > 2f)
         {
             stuck.IdleRescueSince = -1f;
-            return;
+            stuck.IdleRescueIntent = false;
+            stuck.LocalEscape.Reset();
         }
-
-        // Use the agent's own objective, not the squad anchor: a follower holding a splinter position can be
-        // far from the anchor, and gating on the anchor would teleport it mid-guard.
-        var objLoc = agent.Objective?.Location;
-        if (objLoc == null)
+        stuck.IdleRescueLastObservedAt = Time.time;
+        var objective = agent.Objective;
+        if (objective?.Status is ObjectiveStatus.Finished or ObjectiveStatus.Looting or ObjectiveStatus.Extracting)
         {
             stuck.IdleRescueSince = -1f;
+            stuck.IdleRescueIntent = false;
+            stuck.LocalEscape.Reset();
             return;
         }
-
+        if (objective?.Status == ObjectiveStatus.Moving && objective.Location != null)
+        {
+            stuck.IdleRescueIntent = true;
+        }
+        // A squad that cannot obtain any usable objective still needs a way off its stranded chunk.
+        if (agent.Squad?.ConsecutiveDispatchFailures > 0) stuck.IdleRescueIntent = true;
+        if (!stuck.IdleRescueIntent) return;
         var pos = agent.Position;
-
-        // Already near the objective: it arrived, not islanded.
-        if ((objLoc.Position - pos).sqrMagnitude < IdleRescueMinObjectiveDistSqr)
-        {
-            stuck.IdleRescueSince = -1f;
-            return;
-        }
-
         if (stuck.IdleRescueSince < 0f || (pos - stuck.IdleRescueAnchor).sqrMagnitude > IdleRescueNoMoveRadiusSqr)
         {
             stuck.IdleRescueAnchor = pos;
             stuck.IdleRescueSince = Time.time;
+            stuck.LocalEscape.Reset();
             return;
         }
+        if (Time.time - stuck.IdleRescueSince < IdleRescueThresholdSeconds || !stuck.Recovery.ProbeDue(pos)) return;
 
-        if (Time.time - stuck.IdleRescueSince < IdleRescueThresholdSeconds) return;
-
-        if (RescueTeleportToConnectedPoint(agent, objLoc.Position) || RescueTeleportNearSquadmate(agent))
-            stuck.IdleRescued = true;
-
-        // Re-arm either way: on failure, retry after another full window rather than hammering CalculatePath.
+        var goal = objective?.Location;
+        Vector3? target = goal == null ? null : goal.ExfilInteriorPosition ?? goal.Position;
+        var nearby = TryNearbyEscape(agent, target, out var landing);
+        if (nearby == EscapeResult.Pending) return;
+        if (nearby == EscapeResult.Found)
+        {
+            CompleteNearbyEscape(agent, landing);
+            return;
+        }
+        // All nearby same-floor and supported adjacent-floor candidates were checked before the
+        // older, wider same-floor search is allowed to run. No target is abandoned by either path.
+        if (target.HasValue)
+        {
+            if (!RescueTeleportToConnectedPoint(agent, target.Value)) RescueTeleportNearSquadmate(agent);
+        }
+        else
+        {
+            stuck.Recovery.BeginProbe(pos);
+            stuck.Recovery.ProbeFailed();
+        }
         stuck.IdleRescueSince = Time.time;
+        stuck.IdleRescueAnchor = agent.Position;
+    }
+
+    private bool TryLocalRescuePoint(Agent agent, Vector3 candidate, out Vector3 point)
+    {
+        point = default;
+        if (!OrbitMovementRecovery.TrySample(candidate, out point)
+            || (point - agent.Position).sqrMagnitude > 45f * 45f
+            || Mathf.Abs(point.y - agent.Position.y) > 2f
+            || agent.Stuck.Recovery.RecentlyRescuedAt(point)
+            || !BotLandingGuard.Accepts(agent.Bot, point)) return false;
+        // A hidden source does not guarantee a hidden destination, especially across a wall.
+        return IsRescueDestinationHidden(point);
+    }
+
+    private bool IsRescueDestinationHidden(Vector3 point)
+    {
+        foreach (var human in _humanPlayers)
+        {
+            if (human?.HealthController is not { IsAlive: true }) continue;
+            if ((human.Position - point).sqrMagnitude <= 100f) return false;
+            var head = human.PlayerBones.Head.Original.position;
+            for (var height = 0.3f; height <= 1.8f; height += 0.6f)
+                if (!Physics.Linecast(head, point + Vector3.up * height, out _, TeleportVisLayerMask.value)) return false;
+        }
+        return true;
+    }
+
+    private bool CompleteLocalRescue(Agent agent, Vector3 point)
+    {
+        var from = agent.Position;
+        if (!BotLandingGuard.TryPlace(agent.Bot, point, "local-rescue", () => ResumeGroundPlacement(agent))) return false;
+        agent.Stuck.Recovery.RecordLocalRescue(from, agent.Position);
+        ResetAfterRescue(agent);
+        return true;
+    }
+
+    internal void ResumeGroundPlacement(Agent agent)
+    {
+        if (agent.Bot == null || agent.Bot.IsDead) return;
+        agent.Stuck.Recovery.Recovered(agent.Position);
+        ResetAfterRescue(agent);
+    }
+
+    private void ResetAfterRescue(Agent agent, bool resume = true)
+    {
+        ResetPath(agent);
+        agent.Movement.Retry = 0;
+        agent.Movement.DoorInteractHoldUntil = -1f;
+        agent.Movement.NextGhostDoorCheck = 0f;
+        agent.Stuck.Soft.Reset();
+        agent.Stuck.Hard.Status = HardStuckStatus.None;
+        agent.Stuck.Hard.Timer = 0f;
+        agent.Stuck.Hard.AverageSpeed.Reset();
+        agent.Stuck.Hard.PositionHistory.Reset();
+        agent.Stuck.GhostInvalidPathStreak = 0;
+        agent.Stuck.IdleRescueAnchor = agent.Position;
+        agent.Stuck.IdleRescueSince = -1f;
+        agent.Stuck.IdleRescueLastObservedAt = -1f;
+        agent.Stuck.IdleRescueIntent = false;
+        agent.Stuck.LocalEscape.Reset();
+        if (resume) ResumeAfterRescue(agent);
+    }
+
+    private void ResumeAfterRescue(Agent agent)
+    {
+        var objective = agent.Objective;
+        if (!agent.IsActive || objective?.Location == null
+            || objective.Status is not (ObjectiveStatus.Moving or ObjectiveStatus.Failed or ObjectiveStatus.None)) return;
+        agent.ArrivalFailures.Forget(objective.Location.Id);
+        objective.Status = ObjectiveStatus.Moving;
+        objective.ArrivalPath = null;
+        var movement = agent.Movement;
+        var destination = objective.Location.Category == WaypointCategory.Exfil
+            ? objective.Location.ExfilInteriorPosition ?? objective.Location.Position
+            : objective.Location.Position;
+        MoveToByPath(agent, destination, movement.Pose, movement.Speed,
+            movement.Prone, movement.Sprint, movement.Urgency);
+        Log.Debug($"{agent} movement recovery: new route from landing={agent.Position} target={destination} revision={movement.PathRevision}");
+    }
+
+    private void TryReturnToValidatedAnchor(Agent agent)
+    {
+        var recovery = agent.Stuck.Recovery;
+        if (agent.Bot.Memory.IsUnderFire || agent.Bot.Memory.GoalEnemy != null
+            || GhostBodyTransition.Busy(agent.Player) || !recovery.ProbeDue(agent.Position)
+            || !recovery.TryReturnPoint(out var point) || !TeleportSafe(agent, _humanPlayers)) return;
+        // Check the destination too: recovering a hidden body must not make it appear in view.
+        foreach (var human in _humanPlayers)
+        {
+            if (human?.HealthController is not { IsAlive: true }) continue;
+            if ((human.Position - point).sqrMagnitude <= 100f) return;
+            var head = human.PlayerBones.Head.Original.position;
+            for (var height = 0.3f; height <= 1.8f; height += 0.6f)
+                if (!Physics.Linecast(head, point + Vector3.up * height, out _, TeleportVisLayerMask.value)) return;
+        }
+        recovery.BeginProbe(agent.Position);
+        var from = agent.Position;
+        if (!BotLandingGuard.TryRecover(agent.Bot, point, "anchor-return", () => ResumeGroundPlacement(agent)))
+        { recovery.ProbeFailed(); return; }
+        recovery.Recovered(agent.Position);
+        ResetAfterRescue(agent);
+        Log.Warning($"{agent} movement recovery: returned to validated NavMesh anchor from={from} to={agent.Position} surface={point}");
     }
 
     private bool RescueTeleportToConnectedPoint(Agent agent, Vector3 objectivePos, int startRing = 0)
@@ -1137,6 +1597,7 @@ public class MovementSystem
         if (!TeleportSafe(agent, _humanPlayers)) return false;
 
         var pos = agent.Position;
+        if (!agent.Stuck.Recovery.BeginProbe(pos)) return false;
         for (var ri = startRing; ri < IdleRescueRingRadii.Length; ri++)
         {
             var r = IdleRescueRingRadii[ri];
@@ -1145,19 +1606,19 @@ public class MovementSystem
                 var ang = a * (Mathf.PI * 2f / 8f);
                 var candidate = pos + new Vector3(Mathf.Cos(ang) * r, 0f, Mathf.Sin(ang) * r);
                 if (!NavMesh.SamplePosition(candidate, out var hit, 2f, NavMesh.AllAreas)) continue;
+                if (!TryLocalRescuePoint(agent, hit.position, out var point)) continue;
                 // Require a point CONNECTED to the objective; SamplePosition alone could snap back onto the island.
-                if (!NavMesh.CalculatePath(hit.position, objectivePos, NavMesh.AllAreas, _rescuePath)) continue;
+                if (!NavMesh.CalculatePath(point, objectivePos, NavMesh.AllAreas, _rescuePath)) continue;
                 if (_rescuePath.status != NavMeshPathStatus.PathComplete) continue;
 
-                var dest = hit.position;
-                dest.y += 0.25f;
-                agent.Player.Teleport(dest);
-                ResetPath(agent);
-                Log.Info($"{agent} idle-island rescue: teleported {Vector3.Distance(pos, dest):F0}m to a navmesh point connected to its objective (stranded {IdleRescueThresholdSeconds:F0}s)");
+                if (!CompleteLocalRescue(agent, point)) continue;
+                var dest = agent.Position;
+                Log.Info($"{agent} idle-island rescue: teleported {Vector3.Distance(pos, dest):F0}m to a navmesh point connected to its objective (stranded {IdleRescueThresholdSeconds:F0}s), bounded local rescue from={pos} to={dest}");
                 return true;
             }
         }
-        Log.Debug($"{agent} idle-island rescue: no connected navmesh point within {IdleRescueRingRadii[^1]:F0}m — trying squadmate fallback");
+        agent.Stuck.Recovery.ProbeFailed();
+        Log.Debug($"{agent} idle-island rescue: no connected navmesh point within {IdleRescueRingRadii[^1]:F0}m; backing off before another local search");
         return false;
     }
 
@@ -1182,16 +1643,15 @@ public class MovementSystem
             var d = (m.Position - pos).sqrMagnitude;
             if (d < minDistSqr || d >= bestDistSqr) continue;
             if (!NavMesh.SamplePosition(m.Position, out var hit, 3f, NavMesh.AllAreas)) continue;
+            if (!TryLocalRescuePoint(agent, hit.position, out var point)) continue;
             best = m;
             bestDistSqr = d;
-            bestDest = hit.position;
+            bestDest = point;
         }
         if (best == null) return false;
 
-        bestDest.y += 0.25f;
-        agent.Player.Teleport(bestDest);
-        ResetPath(agent);
-        Log.Info($"{agent} idle-island rescue: no objective-connected point, teleported {Vector3.Distance(pos, bestDest):F0}m next to squadmate {best} instead (off the stuck chunk)");
+        if (!CompleteLocalRescue(agent, bestDest)) return false;
+        Log.Info($"{agent} idle-island rescue: no objective-connected point, teleported {Vector3.Distance(pos, bestDest):F0}m next to squadmate {best} instead (off the stuck chunk), bounded local rescue from={pos} to={agent.Position}");
         return true;
     }
 
@@ -1214,6 +1674,12 @@ public class MovementSystem
         if (stuck.SpawnIslandRescued) return; // one-shot; also set once the bot proves it can reach the map
 
         var pos = agent.Position;
+        if (stuck.SpawnProgress.Observe(pos, Time.time))
+        {
+            // Stairs can make nearby candidates valid again without ever leaving the spawn radius.
+            stuck.SpawnIslandWaypointCursor = 0;
+            stuck.SpawnIslandDisconnectedSince = -1f;
+        }
         if (stuck.SpawnIslandSeenAt <= 0f)
         {
             stuck.SpawnIslandPos = pos;
@@ -1229,7 +1695,19 @@ public class MovementSystem
         }
 
         if (Time.time - stuck.SpawnIslandSeenAt < SpawnIslandGraceSeconds) return;
+        if (agent.Objective.Status is ObjectiveStatus.Looting or ObjectiveStatus.Extracting)
+        {
+            stuck.SpawnIslandDisconnectedSince = -1f;
+            return;
+        }
+        if (!stuck.SpawnProgress.Stalled(Time.time)) return;
         if (Time.time < stuck.SpawnIslandNextProbeAt) return; // scheduled backoff after a failed attempt
+
+        // Continue a budgeted nearby search without repeating every cross-map disconnection probe.
+        // Once it exhausts, refresh those references before permitting the distant fallback.
+        if (stuck.LocalEscape.Active && !stuck.LocalEscape.Complete
+            && (pos - stuck.LocalEscape.Origin).sqrMagnitude <= 9f
+            && Time.time - stuck.LocalEscape.LastUsed <= 10f && ContinueSpawnEscape(agent)) return;
         PerfMonitor.SpawnIslandProbes++;
 
         // Find the nearest live agent we CANNOT reach; reaching ANY of them means we're on the main mesh.
@@ -1255,9 +1733,17 @@ public class MovementSystem
 
         if (reference == null)
         {
+            stuck.SpawnIslandDisconnectedSince = -1f;
             // No usable far reference right now (transient — bots die/spawn): retry at the current cadence
             // without consuming an attempt.
             stuck.SpawnIslandNextProbeAt = Time.time + SpawnIslandRetryDelay(stuck.SpawnIslandAttempts);
+            return;
+        }
+
+        if (stuck.SpawnIslandDisconnectedSince < 0f) stuck.SpawnIslandDisconnectedSince = Time.time;
+        if (Time.time - stuck.SpawnIslandDisconnectedSince < 6f)
+        {
+            stuck.SpawnIslandNextProbeAt = Time.time + 3f;
             return;
         }
 
@@ -1268,6 +1754,7 @@ public class MovementSystem
             stuck.SpawnIslandNextProbeAt = Time.time + SpawnIslandRetryDelay(stuck.SpawnIslandAttempts);
             return;
         }
+        if (ContinueSpawnEscape(agent)) return;
         // Anchor reachability on the alive human player (main mesh) if there is one, else the nearest agent.
         var anchorPos = reference.Position;
         for (var i = 0; i < _humanPlayers.Count; i++)
@@ -1275,13 +1762,18 @@ public class MovementSystem
             var p = _humanPlayers[i];
             if (p?.HealthController is { IsAlive: true }) { anchorPos = p.Position; break; }
         }
-        if (TryFindReachableWaypoint(agent, liveAgents, agent.Position, anchorPos, SpawnIslandWaypointSearchRadius, out var wpDest))
+        if (TryFindReachableWaypoint(agent, liveAgents, agent.Position, anchorPos, SpawnIslandWaypointSearchRadius, out var wpDest)
+            && !BotLandingGuard.IsRejected(agent.Bot, wpDest))
         {
             var fromPos = agent.Position;
-            agent.Player.Teleport(wpDest);
-            ResetPath(agent);
+            if (!BotLandingGuard.TryPlace(agent.Bot, wpDest, "spawn-rescue", () => ResumeGroundPlacement(agent)))
+            {
+                stuck.SpawnIslandNextProbeAt = Time.time + SpawnIslandRetryDelay(++stuck.SpawnIslandAttempts);
+                return;
+            }
+            ResetAfterRescue(agent, resume: false);
             agent.Stuck.SpawnIslandRescued = true;
-            Log.Info($"{agent} spawn-island rescue: teleported {Vector3.Distance(fromPos, wpDest):F0}m to the nearest reachable waypoint (off the disconnected spawn chunk)");
+            Log.Info($"{agent} spawn-island rescue: teleported {Vector3.Distance(fromPos, wpDest):F0}m to a reachable waypoint (off the disconnected spawn chunk) from={fromPos} to={wpDest}");
             RefreshSquadAfterIslandRescue(agent, wpDest);
             return;
         }
@@ -1298,6 +1790,23 @@ public class MovementSystem
     // teleported bots on the navmesh.
     private const float PostIslandRescueCooldownSeconds = 5f;
 
+    private bool ContinueSpawnEscape(Agent agent)
+    {
+        var goal = agent.Objective?.Location;
+        Vector3? target = goal == null ? null : goal.ExfilInteriorPosition ?? goal.Position;
+        var nearby = TryNearbyEscape(agent, target, out var localDest);
+        if (nearby == EscapeResult.Exhausted) return false;
+        var stuck = agent.Stuck;
+        if (nearby == EscapeResult.Pending) stuck.SpawnIslandNextProbeAt = Time.time + .25f;
+        else if (CompleteNearbyEscape(agent, localDest, resume: false))
+        {
+            stuck.SpawnIslandRescued = true;
+            RefreshSquadAfterIslandRescue(agent, localDest);
+        }
+        else stuck.SpawnIslandNextProbeAt = Time.time + 3f;
+        return true;
+    }
+
     // An islanded squad "maps" the raid from its disconnected chunk before the rescue fires: every
     // reachability verdict lands in the per-squad unreachable cache as PathPartial, quest mains are all
     // rejected from the island spawn position, and the current objective points at an island POI. Without
@@ -1306,7 +1815,15 @@ public class MovementSystem
     private void RefreshSquadAfterIslandRescue(Agent agent, Vector3 dest)
     {
         var squad = agent.Squad;
-        if (squad == null) return;
+        if (squad == null) { ResumeAfterRescue(agent); return; }
+
+        // A relocation repairs the approach to an already selected exit, it does not replace that exit.
+        if (squad.ExtractRequested || agent.SoloExtractRequested)
+        {
+            _waypointSystem.ClearSquadUnreachability(squad);
+            ResumeAfterRescue(agent);
+            return;
+        }
 
         // Drop the agent's own (island) objective, same as RescueInterceptPatch after a BSG rescue.
         agent.Objective.Status = ObjectiveStatus.Failed;
@@ -1355,20 +1872,53 @@ public class MovementSystem
                 if ((wp.Position - fromPos).sqrMagnitude <= maxRadSqr) _wpScratch.Add(wp);
             }
         }
-        _wpScratch.Sort((x, y) => (x.Position - fromPos).sqrMagnitude.CompareTo((y.Position - fromPos).sqrMagnitude));
-
-        var cap = Mathf.Min(_wpScratch.Count, 40); // bound the CalculatePath calls
-        for (var i = 0; i < cap; i++)
+        // Keep ordering stable while the bot shuffles on its island. Each retry advances past the
+        // previous batch, so farther usable POIs are not starved by the same 40 nearest failures.
+        var spawn = agent.Stuck.SpawnIslandPos;
+        _wpScratch.Sort((x, y) =>
         {
+            var distanceOrder = (x.Position - spawn).sqrMagnitude.CompareTo((y.Position - spawn).sqrMagnitude);
+            return distanceOrder != 0 ? distanceOrder : x.Id.CompareTo(y.Id);
+        });
+        var count = _wpScratch.Count;
+        var start = count > 0 ? agent.Stuck.SpawnIslandWaypointCursor % count : 0;
+        // Spend half of a continued search rechecking nearby points before extending farther.
+        // The total remains bounded at forty candidates per probe.
+        var nearCount = start >= 40 ? Mathf.Min(20, count) : 0;
+        var end = Mathf.Min(count, start + 40 - nearCount);
+        var mesh = 0;
+        var height = 0;
+        var rangeRejected = 0;
+        var occupied = 0;
+        var visible = 0;
+        var unreachable = 0;
+        var recent = 0;
+        var tested = 0;
+        var found = false;
+        for (var step = 0; step < nearCount + end - start; step++)
+        {
+            var i = step < nearCount ? step : start + step - nearCount;
+            tested++;
+            if (step >= nearCount) agent.Stuck.SpawnIslandWaypointCursor = i + 1 < count ? i + 1 : 0;
             var wp = _wpScratch[i];
-            if (!_waypointSystem.IsReachableFromPosition(anchorPos, wp.Position)) continue;
-            if (!NavMesh.SamplePosition(wp.Position, out var hit, 2f, NavMesh.AllAreas)) continue;
-            if (!IsClearOfPlayersAndBots(hit.position, agent, liveAgents)) continue;
-            dest = hit.position;
-            dest.y += 0.25f;
-            return true;
+            if (!NavMesh.SamplePosition(wp.Position, out var hit, 2f, NavMesh.AllAreas)
+                || !OrbitMovementRecovery.TrySample(hit.position, out var point)) { mesh++; continue; }
+            if (Mathf.Abs(point.y - fromPos.y) > 2f) { height++; continue; }
+            if ((point - fromPos).sqrMagnitude > maxRadSqr) { rangeRejected++; continue; }
+            if ((point - fromPos).sqrMagnitude < 9f
+                || agent.Stuck.Recovery.RecentlyRescuedAt(point)) { recent++; continue; }
+            if (!IsClearOfPlayersAndBots(point, agent, liveAgents)) { occupied++; continue; }
+            if (!IsRescueDestinationHidden(point)) { visible++; continue; }
+            // Test the actual landing, not the loot transform that may be above or beside it.
+            if (!_waypointSystem.IsReachableFromPosition(anchorPos, point)) { unreachable++; continue; }
+            if (!BotLandingGuard.Accepts(agent.Bot, point)) { occupied++; continue; }
+            dest = point;
+            found = true;
+            break;
         }
-        return false;
+        if (count == 0) agent.Stuck.SpawnIslandWaypointCursor = 0;
+        Log.Debug($"{agent} spawn-island candidates: total={count} start={start} tested={tested} next={agent.Stuck.SpawnIslandWaypointCursor} mesh={mesh} height={height} range={rangeRejected} occupied={occupied} visible={visible} unreachable={unreachable} recent={recent} found={found}");
+        return found;
     }
 
     private bool IsPathComplete(Vector3 from, Vector3 to)
@@ -1581,7 +2131,13 @@ public class MovementSystem
 
         private void AttemptTeleport(Agent agent)
         {
-            if (!TeleportSafe(agent, humanPlayers)) return;
+            if (!TeleportSafe(agent, humanPlayers) || !agent.Stuck.Recovery.ProbeDue(agent.Position)) return;
+
+            var objLoc = agent.Objective?.Location;
+            Vector3? target = objLoc == null ? null : objLoc.ExfilInteriorPosition ?? objLoc.Position;
+            var nearby = movementSystem.TryNearbyEscape(agent, target, out var localDest);
+            if (nearby == EscapeResult.Pending) return;
+            if (nearby == EscapeResult.Found) { movementSystem.CompleteNearbyEscape(agent, localDest); return; }
 
             // Escalate on re-stick: teleporting again from ~the same spot means the bot re-wedged, so jump to a
             // farther rescue ring instead of dropping it a few metres away to re-stick.
@@ -1592,17 +2148,44 @@ public class MovementSystem
                 ? stuck.TeleportCount + 1
                 : 1;
             stuck.LastTeleportPos = pos;
+            if (++stuck.RescueStreak % 3 == 0) ReportRescueLoop(agent, stuck.RescueStreak);
             var startRing = stuck.TeleportCount <= 1 ? 0 : stuck.TeleportCount == 2 ? 2 : 3; // rings {4,8,16,28,45}
 
             // Prefer an unsticking teleport (objective-connected point, else a squadmate); path-corner is last resort.
-            var objLoc = agent.Objective?.Location;
-            if (objLoc != null && movementSystem.RescueTeleportToConnectedPoint(agent, objLoc.Position, startRing)) return;
+            if (target.HasValue && movementSystem.RescueTeleportToConnectedPoint(agent, target.Value, startRing)) return;
             if (movementSystem.RescueTeleportNearSquadmate(agent)) return;
 
-            var teleportPos = agent.Movement.Path[agent.Movement.CurrentCorner];
-            teleportPos.y += 0.25f;
-            agent.Player.Teleport(teleportPos);
-            Log.Debug($"{agent} teleporting to {teleportPos} (path-corner fallback)");
+            var path = agent.Movement.Path;
+            var corner = agent.Movement.CurrentCorner;
+            if (path == null || corner < 0 || corner >= path.Length
+                || !movementSystem.TryLocalRescuePoint(agent, path[corner], out var teleportPos)
+                || !movementSystem.CompleteLocalRescue(agent, teleportPos)) return;
+            Log.Debug($"{agent} teleporting to {teleportPos} (validated local path-corner fallback)");
+        }
+
+        // Three rescues in a row without the bot reaching anything on its own is not geometry any more,
+        // it is the body refusing to move (Customs raid: FantaSipper, 30 teleports in a row after waking
+        // with a meds animation frozen in flight). Dump the movement state and undo the known cause.
+        private static void ReportRescueLoop(Agent agent, int streak)
+        {
+            var bot = agent.Bot;
+            var player = agent.Player;
+            string state = "?", hands = "?", meds = "?", ctx = "?";
+            try { state = player.CurrentManagedState?.GetType().Name ?? "null"; } catch { }
+            try { hands = player.HandsController?.GetType().Name ?? "null"; } catch { }
+            try { meds = bot?.Medecine == null ? "null" : $"using={bot.Medecine.Using} firstAid={bot.Medecine.FirstAid?.Have2Do} surgery={bot.Medecine.SurgicalKit?.HaveWork}"; } catch { }
+            try
+            {
+                var mc = player.MovementContext;
+                ctx = $"grounded={mc.IsGrounded} freefall={mc.FreefallTime:F1}s pose={mc.PoseLevel:F2} speed={mc.CharacterMovementSpeed:F2} botState={bot?.BotState}";
+            }
+            catch { }
+            Log.Warning($"{agent} {streak} stuck rescues in a row without walking: state={state} hands={hands} meds=[{meds}] {ctx}");
+            if (bot?.Medecine is { Using: true })
+            {
+                Log.Warning($"{agent} meds state is stuck, taking the main weapon back in hands");
+                try { bot.WeaponManager?.Selector?.TakeMainWeapon(); } catch { }
+            }
         }
     }
 }
