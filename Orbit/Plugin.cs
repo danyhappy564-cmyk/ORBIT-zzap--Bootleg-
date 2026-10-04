@@ -39,7 +39,7 @@ public class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "com.chazut.orbit";
     public const string PluginName = "ORBIT";
-    public const string OrbitVersion = "2.1.0";
+    public const string OrbitVersion = "2.1.1";
 
     public static ManualLogSource LogSource;
 
@@ -63,6 +63,8 @@ public class Plugin : BaseUnityPlugin
     // ApplyFactionTakeoverToggle) so a future com.-prefixed variant ("com.samc137.ISBinfo") still registers.
     private const string IsbPluginGuid = "samc137.ISBinfo";
     private const string CombineSoldiersPluginGuid = "com.manimal.combinesoldiers";
+
+    private void Update() => PerformanceJournal.RefreshWriter();
 
     private void Awake()
     {
@@ -148,6 +150,8 @@ public class Plugin : BaseUnityPlugin
         EnableSafe(new InventoryChangePatch());
         EnableSafe(new LootItemKilledPatch());
         EnableSafe(new CorpseRegistrationPatch());
+        GhostDeathDiagnostics.Enable();
+        GhostWakeActivationDiagnostics.Enable();
         EnableSafe(new RescueInterceptPatch());
 
         // BSG layer bypasses
@@ -311,8 +315,8 @@ public class Plugin : BaseUnityPlugin
             "Which message levels ORBIT writes (used when Quiet logging is OFF). Default: everything except Debug. Tick Debug for a detailed bug-report log - it works in the release build now, not just debug builds.",
             null, new ConfigurationManagerAttributes { Category = "", Order = 0 }));
         PerfLogging = Config.Bind(essentials, "Performance logging", false, new ConfigDescription(
-            "ON: writes a one-line 'PERF' summary (fps, hitches, GC, ORBIT activity counters) to the log every 30s, regardless of the other logging settings. Turn it on before recording a raid for a performance report.",
-            null, new ConfigurationManagerAttributes { Category = "", Order = -1, IsAdvanced = true }));
+            "ON: records every frame over the 60 FPS budget (16.67 ms), slow bot decisions and Ghost transitions, even with Quiet logging. Automatically saves a performance journal in BepInEx/ORBIT/diagnostics during the raid and a final summary when it ends. Larger stalls also save a detailed JSON capture.",
+            null, new ConfigurationManagerAttributes { Category = "", Order = -1 }));
     }
 
     // F12 helper: a real button that opens the server web UI in the default browser. The drawer

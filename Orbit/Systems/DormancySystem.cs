@@ -372,12 +372,17 @@ public partial class DormancySystem
     {
         if (!_enabled) return;
         // Check before scheduled shots/kills: spectators must see live combat after waking.
-        if (UpdateSpectatorMode()) return;
+        using (TransitionPerformance.Measure(TransitionPhase.GhostSpectator))
+            if (UpdateSpectatorMode()) { ClearStagedWakes(); return; }
+        PumpStagedWakes();
         if (_pendingShots.Count > 0) PumpGhostFightShots();
         if (_activeFights.Count > 0) PumpGhostFights();
-        _nativeMoveScratch.Clear();
-        _nativeMoveScratch.AddRange(_vanillaDormant);
-        for (var i = 0; i < _nativeMoveScratch.Count; i++) _nativeGhosts.Move(_nativeMoveScratch[i]);
+        using (TransitionPerformance.Measure(TransitionPhase.GhostNativeMove))
+        {
+            _nativeMoveScratch.Clear();
+            _nativeMoveScratch.AddRange(_vanillaDormant);
+            for (var i = 0; i < _nativeMoveScratch.Count; i++) _nativeGhosts.Move(_nativeMoveScratch[i]);
+        }
         if (!_pollPacing.Allowed()) return;
 
         // The whole poll is crash-proofed: raid-3 test showed a single throwing access (a despawning
@@ -400,18 +405,21 @@ public partial class DormancySystem
     private void PollOnce(List<Agent> liveAgents, List<Squad> squads)
     {
         ScanWorld();
-        UpdateScopeState();
+        using (TransitionPerformance.Measure(TransitionPhase.GhostScope)) UpdateScopeState();
 
-        if (!string.Equals(_cfg.GhostAwakeBehavior, "wake_ghost", System.StringComparison.OrdinalIgnoreCase))
-            UpdateSleepPreferred(liveAgents, squads);
-        else
-            UpdateWakePreferred(liveAgents, squads);
+        using (TransitionPerformance.Measure(TransitionPhase.GhostAdmission))
+        {
+            if (!string.Equals(_cfg.GhostAwakeBehavior, "wake_ghost", System.StringComparison.OrdinalIgnoreCase))
+                UpdateSleepPreferred(liveAgents, squads);
+            else
+                UpdateWakePreferred(liveAgents, squads);
+        }
 
         if (_fightsMode != GhostFightsMode.Off)
             ResolveGhostSkirmishes(squads);
 
-        PollGhostHearing(squads);
-        HealDormantWounded();
+        using (TransitionPerformance.Measure(TransitionPhase.GhostHearing)) PollGhostHearing(squads);
+        using (TransitionPerformance.Measure(TransitionPhase.GhostHealing)) HealDormantWounded();
 
         EmitSummaryIfDue(liveAgents.Count);
     }
@@ -428,19 +436,21 @@ public partial class DormancySystem
             var squad = squads[i];
             if (squad == null || squad.Members.Count == 0) continue;
 
-            if (IsSquadDormant(squad))
+            var dormant = SquadDormantCount(squad);
+            if (dormant > 0)
             {
                 var reason = WakeReason(squad);
                 if (reason != null)
                 {
                     _wakeQueue.Add(squad);
                     _wakeReasons.Add(reason.Value);
+                    continue;
                 }
             }
-            else
+            if (dormant < squad.Members.Count)
             {
                 UpdateHpTracking(squad);
-                if (CanSleep(squad)) _sleepCandidates.Add(squad);
+                if (CanSleep(squad, joining: dormant > 0)) _sleepCandidates.Add(squad);
             }
         }
 
@@ -467,15 +477,20 @@ public partial class DormancySystem
         for (var i = 0; i < _sleepCandidates.Count; i++)
         {
             var squad = _sleepCandidates[i];
-            var defaultDormant = IsDefaultDormantSquad(squad);
-            if (!defaultDormant && awakeStandard - squad.Members.Count < floor) { _blockedFloor++; continue; }
+            var standard = SquadAwakeStandardCount(squad);
+            if (standard > 0 && awakeStandard - standard < floor) { _blockedFloor++; continue; }
             if (AnyRemainingAwakeBotNear(squad)) { _blockedProximity++; continue; }
 
             SleepSquad(squad);
-            if (!defaultDormant) awakeStandard -= squad.Members.Count;
+            awakeStandard -= standard;
         }
+        WakeIncompleteSquads(squads);
         UpdateVanilla(ref awakeStandard, floor);
-        _lastAwakeStandard = awakeStandard;
+        _lastAwakeStandard = 0;
+        foreach (var agent in liveAgents)
+            if (agent != null && !agent.IsDormant && !IsDefaultDormant(agent.Bot)) _lastAwakeStandard++;
+        var nativeTotal = 0;
+        CountNativeStandard(ref nativeTotal, ref _lastAwakeStandard);
 
     }
 
@@ -483,6 +498,7 @@ public partial class DormancySystem
     /// corpse or despawned bot is never left as an invisible inactive GameObject.</summary>
     public void OnAgentRemoved(Agent agent)
     {
+        ForgetStagedBot(agent.Bot);
         NativeAwakeGrenadeDiagnostics.Forget(agent.Bot);
         if (!agent.IsDormant) return;
         agent.IsDormant = false;
@@ -532,6 +548,8 @@ public partial class DormancySystem
 
     private void ScanWorld()
     {
+        using var phaseTiming = TransitionPerformance.Measure(TransitionPhase.GhostScan);
+        BeginWakeHumanScan();
         _humanPositions.Clear();
         _targetedBy.Clear();
 
@@ -547,6 +565,7 @@ public partial class DormancySystem
                 if (!player.AIData.IsAI)
                 {
                     _humanPositions.Add(player.Position);
+                    TrackWakeHuman(player);
                     continue;
                 }
 
@@ -571,8 +590,23 @@ public partial class DormancySystem
 
     private static bool IsSquadDormant(Squad squad)
     {
-        // Atomic by construction (squads sleep and wake whole), so the first member's flag is the squad's.
-        return squad.Members.Count > 0 && squad.Members[0].IsDormant;
+        // Registration is staggered: a late member can temporarily join an already sleeping squad.
+        return squad.Members.Count > 0 && SquadDormantCount(squad) == squad.Members.Count;
+    }
+
+    private static int SquadDormantCount(Squad squad)
+    {
+        var count = 0;
+        foreach (var agent in squad.Members) if (agent.IsDormant) count++;
+        return count;
+    }
+
+    private int SquadAwakeStandardCount(Squad squad)
+    {
+        var count = 0;
+        foreach (var agent in squad.Members)
+            if (!agent.IsDormant && !IsDefaultDormant(agent.Bot)) count++;
+        return count;
     }
 
     private bool IsDefaultDormantSquad(Squad squad)
@@ -596,8 +630,9 @@ public partial class DormancySystem
         }
     }
 
-    private bool CanSleep(Squad squad)
+    private bool CanSleep(Squad squad, bool joining = false)
     {
+        if (IsWaking(squad)) return false;
         // Distance gate first: a squad near a human is simply "in play", not diagnostic. Everything
         // counted below answers the verification question "why does a FAR squad stay awake?".
         // Default-dormant types (per-type toggles) use the tighter ring.
@@ -620,6 +655,9 @@ public partial class DormancySystem
         for (var i = 0; i < squad.Members.Count; i++)
         {
             var agent = squad.Members[i];
+            // Existing sleepers were checked by WakeReason before admission. Their inactive bodies
+            // must not block a newcomer or have their inventory/HP baseline initialized again.
+            if (joining && agent.IsDormant) continue;
             var bot = agent.Bot;
             if (bot == null || bot.IsDead || bot.BotState != EBotState.Active) { _farBlockedState++; return false; }
             if (!bot.gameObject.activeSelf) { _farBlockedState++; return false; } // someone else owns the GameObject — never fight over it
@@ -748,7 +786,7 @@ public partial class DormancySystem
             // Position-based damage (border minefields at least) lands on inactive bodies, and a sleeper
             // can neither react nor heal — hand it back to SAIN immediately.
             var hp = TotalHp(agent);
-            if (hp < agent.DormantHpBaseline - 1f)
+            if (agent.IsDormant && hp < agent.DormantHpBaseline - 1f)
             {
                 return new(GhostWakeCause.Damage, $"{agent} took {agent.DormantHpBaseline - hp:F0} damage while dormant at {agent.Position}" +
                        (DangerZones.IsInside(agent.Position) ? " (inside a border/minefield zone)" : ""));
@@ -758,7 +796,7 @@ public partial class DormancySystem
             if (!reason.HasValue && InScopedView(agent.Position, out var scopeDist)) reason = new(GhostWakeCause.ScopedView, $"in scoped view at {scopeDist:F0}m");
             if (!reason.HasValue && proximity && awakeBotTriggerArmed && AnyAwakeBotNear(agent.Position, squad)) reason = new(GhostWakeCause.BotProximity, $"awake bot near {agent}");
         }
-        return reason;
+        return reason ?? PreWakeReason(squad);
     }
 
     private float MinSqrDistanceToHumans(Vector3 position)
@@ -885,17 +923,29 @@ public partial class DormancySystem
 
     private void SleepSquad(Squad squad)
     {
+        if (IsWaking(squad)) return;
+        using var timing = TransitionPerformance.Measure(TransitionPhase.SleepGroup);
+        var joining = SquadDormantCount(squad) > 0;
+        var added = 0;
         var minHumanSqr = float.MaxValue;
         for (var i = 0; i < squad.Members.Count; i++)
         {
-            SleepAgent(squad.Members[i]);
+            if (!squad.Members[i].IsDormant)
+            {
+                SleepAgent(squad.Members[i]);
+                added++;
+            }
             var d = MinSqrDistanceToHumans(squad.Members[i].Position);
             if (d < minHumanSqr) minHumanSqr = d;
         }
-        squad.DormancySleptAt = Time.time;
+        if (added == 0) return;
+        if (!joining) squad.DormancySleptAt = Time.time;
         _windowSleeps++;
         var humanDist = minHumanSqr < float.MaxValue ? $"{Mathf.Sqrt(minHumanSqr):F0}m" : "none";
-        Log.Info($"{squad} dormant (nearest human {humanDist}, {squad.Members.Count} bots asleep, {_dormantAgents.Count} total dormant)");
+        if (joining)
+            Log.Info($"{squad} Ghost membership reconciled: {added} new members asleep ({squad.Members.Count} total, nearest human {humanDist})");
+        else
+            Log.Info($"{squad} dormant (nearest human {humanDist}, {squad.Members.Count} bots asleep, {_dormantAgents.Count} total dormant)");
     }
 
     private void SleepAgent(Agent agent)
@@ -910,7 +960,8 @@ public partial class DormancySystem
             bot.DecisionQueue.Clear();
             bot.Memory.GoalEnemy = null;
             bot.PatrollingData.Pause();
-            bot.gameObject.SetActive(false);
+            using (TransitionPerformance.Measure(TransitionPhase.SleepBody))
+                bot.gameObject.SetActive(false);
             ThrottleBrain(bot);
         }
         catch (System.Exception e)
@@ -924,6 +975,7 @@ public partial class DormancySystem
         agent.IsDormant = true;
         _dormantAgents.Add(agent);
         DormantProfileIds.Add(agent.Player.ProfileId);
+        PerformanceJournal.Event("sleep", agent.Player.ProfileId, squadId: agent.Squad?.Id ?? -1);
         FinishSpawnProtection(bot);
     }
 
@@ -931,6 +983,7 @@ public partial class DormancySystem
     {
         switch (cause)
         {
+            case GhostWakeCause.PreWake:
             case GhostWakeCause.HumanProximity: _wakeByHuman++; break;
             case GhostWakeCause.ScopedView: _wakeByScope++; break;
             case GhostWakeCause.BotProximity: _wakeByAwakeBot++; break;
@@ -942,19 +995,33 @@ public partial class DormancySystem
 
     private void WakeSquad(Squad squad, GhostWakeReason reason)
     {
-        for (var i = 0; i < squad.Members.Count; i++)
-            WakeAgent(squad.Members[i]);
-        squad.DormancySleepAllowedAt = Time.time + reason.CooldownSeconds;
-        _windowWakes++;
-        RecordWake(reason.Cause);
-        Log.Info($"{squad} awake: {reason.Message} ({_dormantAgents.Count} still dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
+        if (TryStageWake(squad, reason)) return;
+        CancelStagedWake(squad);
+        _wakeFrameBudget.Urgent(Time.frameCount);
+        try
+        {
+            using var timing = TransitionPerformance.Measure(TransitionPhase.WakeGroup);
+            for (var i = 0; i < squad.Members.Count; i++)
+                // Awake or initializing newcomers already own their body. Never PostActivate them here.
+                if (squad.Members[i].IsDormant) WakeAgentWithReason(squad.Members[i], reason);
+            squad.DormancySleepAllowedAt = Time.time + reason.CooldownSeconds;
+            _windowWakes++;
+            RecordWake(reason.Cause);
+            Log.Info($"{squad} awake: {reason.Message} ({_dormantAgents.Count} still dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
+        }
+        finally { _wakeFrameBudget.Complete(System.Diagnostics.Stopwatch.GetTimestamp(), _cfg.WakeIntervalMs); }
     }
 
     private void WakeAgent(Agent agent)
+        => WakeAgentWithReason(agent, new(GhostWakeCause.GroupChanged, "ownership changed"));
+
+    private void WakeAgentWithReason(Agent agent, GhostWakeReason reason)
     {
+        if (agent.IsDormant) RecordWakeEvent(agent.Player, reason);
         var bot = agent.Bot;
         var player = agent.Player;
 
+        GhostWakeActivationDiagnostics.Track(bot);
         agent.IsDormant = false;
         // Fresh tracking state so the bleed gate starts from the wake-time HP.
         agent.LastPollHp = TotalHp(agent);
@@ -967,7 +1034,8 @@ public partial class DormancySystem
         {
             // Questing Bots' proven recipe: PostActivate is mandatory, deactivation leaves BotState=NonActive.
             UnthrottleBrain(bot);
-            bot.gameObject.SetActive(true);
+            using (TransitionPerformance.Measure(TransitionPhase.WakeBody))
+                bot.gameObject.SetActive(true);
             bot.PatrollingData.Unpause();
             bot.PostActivate();
             // Ground and fall bookkeeping were frozen while dormant (DormantGroundCollisionPatch): restart
@@ -989,6 +1057,8 @@ public partial class DormancySystem
                 agent.GhostHandsResync = false;
                 Orbit.Looting.WeaponSwap.WeaponSwapper.ResyncHandsAfterWake(bot, agent.ToString());
             }
+
+            using var navigationTiming = TransitionPerformance.Measure(TransitionPhase.WakeNavigation);
 
             // Ghost movement can leave the body marginally off-mesh (or squarely off it when the wake
             // lands mid-segment on a slope); snap back before the mover resumes. Path corners are
@@ -1198,6 +1268,7 @@ public partial class DormancySystem
     /// </summary>
     private void ResolveGhostSkirmishes(List<Squad> squads)
     {
+        using var phaseTiming = TransitionPerformance.Measure(TransitionPhase.GhostContacts);
         BuildGhostUnits(squads);
         if (_ghostUnits.Count < 2) return;
 
@@ -1348,7 +1419,7 @@ public partial class DormancySystem
         for (var i = 0; i < squads.Count; i++)
         {
             var squad = squads[i];
-            if (squad == null || squad.Members.Count == 0 || !IsSquadDormant(squad)) continue;
+            if (squad == null || squad.Members.Count == 0 || !IsSquadDormant(squad) || IsWaking(squad)) continue;
             var lead = squad.Members[0];
             var unit = new GhostUnit
             {
@@ -1372,6 +1443,7 @@ public partial class DormancySystem
 
         foreach (var kv in _vanillaGroups)
         {
+            if (IsWaking(kv.Key)) continue;
             var group = kv.Value;
             if (group.Count == 0 || !_vanillaDormant.Contains(group[0])) continue;
             var lead = group[0].GetPlayer;
@@ -1749,6 +1821,7 @@ public partial class DormancySystem
     /// wear lands (dormancy-silent) and the units are released.</summary>
     private void PumpGhostFights()
     {
+        using var phaseTiming = TransitionPerformance.Measure(TransitionPhase.GhostFights);
         for (var i = _activeFights.Count - 1; i >= 0; i--)
         {
             var fight = _activeFights[i];
@@ -2130,6 +2203,7 @@ public partial class DormancySystem
 
     private void PumpGhostFightShots()
     {
+        using var phaseTiming = TransitionPerformance.Measure(TransitionPhase.GhostShots);
         var audio = Singleton<BetterAudio>.Instance;
         if (audio == null)
         {
@@ -2146,11 +2220,15 @@ public partial class DormancySystem
                 var listenerDist = Mathf.Sqrt(MinSqrDistanceToHumans(shot.Pos));
                 if (shot.IsTail)
                 {
-                    Api.GhostShotPlayback.PlayTail(audio, shot.Sound, shot.LoopSource, shot.Pos, listenerDist);
+                    using (TransitionPerformance.Measure(TransitionPhase.GhostAudioTail))
+                        Api.GhostShotPlayback.PlayTail(audio, shot.Sound, shot.LoopSource, shot.Pos, listenerDist);
                     continue;
                 }
                 var rounds = Mathf.Max(1, shot.Rounds);
-                var source = Api.GhostShotPlayback.Play(audio, shot.Sound, shot.Pos, listenerDist, rounds, out var tailDelay);
+                BetterSource source;
+                float tailDelay;
+                using (TransitionPerformance.Measure(TransitionPhase.GhostAudioPlay))
+                    source = Api.GhostShotPlayback.Play(audio, shot.Sound, shot.Pos, listenerDist, rounds, out tailDelay);
                 if (source == null)
                 {
                     _windowShotsDropped += rounds;
@@ -2273,20 +2351,28 @@ public partial class DormancySystem
     /// </summary>
     private void KillWithAttribution(Player victim, Player killer)
     {
-        var damageInfo = new EFT.Ballistics.DamageInfo
+        // Includes synchronous engine and mod death callbacks, not only ORBIT's own work.
+        using var timing = TransitionPerformance.Measure(TransitionPhase.GhostDeathDamage);
+        using var deathContext = GhostDeathDiagnostics.Begin(victim);
+        EFT.Ballistics.DamageInfo damageInfo;
+        using (TransitionPerformance.Measure(TransitionPhase.GhostDeathInfo))
         {
-            DamageType = EDamageType.Bullet,
-            Damage = 500f,
-            HitPoint = victim.Position + new Vector3(0f, 1.3f, 0f),
-            Direction = killer != null ? (victim.Position - killer.Position).normalized : Vector3.forward,
-        };
-        if (killer != null)
-        {
-            try { damageInfo.Player = _gameWorld.GetAlivePlayerBridgeByProfileID(killer.ProfileId); }
-            catch { }
-            // Killfeed cosmetics: name the killer's in-hands weapon when there is one.
-            try { damageInfo.Weapon = killer.HandsController?.Item; }
-            catch { }
+            damageInfo = new EFT.Ballistics.DamageInfo
+            {
+                DamageType = EDamageType.Bullet,
+                Damage = 500f,
+                HitPoint = victim.Position + new Vector3(0f, 1.3f, 0f),
+                Direction = killer != null ? (victim.Position - killer.Position).normalized : Vector3.forward,
+            };
+            if (killer != null)
+            {
+                try { damageInfo.Player = _gameWorld.GetAlivePlayerBridgeByProfileID(killer.ProfileId); }
+                catch { }
+                // Killfeed cosmetics: name the killer's in-hands weapon when there is one.
+                try { damageInfo.Weapon = killer.HandsController?.Item; }
+                catch { }
+            }
+
         }
 
         // MUST go through the Player-level entry point: ApplyDamageInfo is what sets LastAggressor
@@ -2294,27 +2380,39 @@ public partial class DormancySystem
         // (raid-review's kill feed hook, EFT's own aggressor stats) when LastAggressor is non-null.
         // Hitting ActiveHealthController.ApplyDamage directly produces an anonymous death: real corpse,
         // no kill feed, no death marker (raid 7 lesson).
-        victim.ApplyDamageInfo(damageInfo, EBodyPart.Chest, EBodyPartColliderType.RibcageUp, 0f);
+        using (TransitionPerformance.Measure(TransitionPhase.GhostDeathChest))
+            victim.ApplyDamageInfo(damageInfo, EBodyPart.Chest, EBodyPartColliderType.RibcageUp, 0f);
         if (victim.ActiveHealthController is { IsAlive: true })
-            victim.ApplyDamageInfo(damageInfo, EBodyPart.Head, EBodyPartColliderType.HeadCommon, 0f);
+            using (TransitionPerformance.Measure(TransitionPhase.GhostDeathHead))
+                victim.ApplyDamageInfo(damageInfo, EBodyPart.Head, EBodyPartColliderType.HeadCommon, 0f);
         if (victim.ActiveHealthController is { IsAlive: true })
-            victim.ActiveHealthController.Kill(EDamageType.Bullet); // last-resort unattributed
+            using (TransitionPerformance.Measure(TransitionPhase.GhostDeathFallback))
+                victim.ActiveHealthController.Kill(EDamageType.Bullet); // last-resort unattributed
     }
 
     /// <summary>Re-activates the body, then kills it through the normal death pipeline: ragdoll, corpse
     /// registration, RemoveAgent (which also finalises our dormancy bookkeeping via OnAgentRemoved).</summary>
     private void KillGhostAgent(Agent victim, Player killer)
     {
-        victim.IsDormant = false;
-        _dormantAgents.Remove(victim);
-        DormantProfileIds.Remove(victim.Player.ProfileId);
+        using var timing = PerformanceJournal.Measure(TransitionPhase.GhostDeath, "ghost-death",
+            profile: victim.Player?.ProfileId, always: true, details: true);
+        using (TransitionPerformance.Measure(TransitionPhase.GhostDeathPrepare))
+        {
+            victim.IsDormant = false;
+            _dormantAgents.Remove(victim);
+            DormantProfileIds.Remove(victim.Player.ProfileId);
+        }
         try
         {
-            var bot = victim.Bot;
-            UnthrottleBrain(bot);
-            bot.gameObject.SetActive(true);
-            bot.PatrollingData.Unpause();
-            bot.PostActivate();
+            using (TransitionPerformance.Measure(TransitionPhase.GhostDeathRestore))
+            {
+                var bot = victim.Bot;
+                UnthrottleBrain(bot);
+                using (TransitionPerformance.Measure(TransitionPhase.WakeBody))
+                    bot.gameObject.SetActive(true);
+                bot.PatrollingData.Unpause();
+                bot.PostActivate();
+            }
             Log.Info($"GHOST SKIRMISH: {victim} killed in action by {killer?.Profile?.Nickname ?? "?"}");
             KillWithAttribution(victim.Player, killer);
         }
@@ -2326,16 +2424,26 @@ public partial class DormancySystem
 
     private void KillGhostVanilla(BotOwner victim, Player killer)
     {
-        var native = _nativeGhosts.Remove(victim);
-        _vanillaDormant.Remove(victim);
-        UnthrottleBrain(victim);
-        DormantProfileIds.Remove(victim.GetPlayer?.ProfileId);
+        using var timing = PerformanceJournal.Measure(TransitionPhase.GhostDeath, "ghost-death",
+            profile: victim.ProfileId, always: true, details: true);
+        bool native;
+        using (TransitionPerformance.Measure(TransitionPhase.GhostDeathPrepare))
+        {
+            native = _nativeGhosts.Remove(victim);
+            _vanillaDormant.Remove(victim);
+            UnthrottleBrain(victim);
+            DormantProfileIds.Remove(victim.GetPlayer?.ProfileId);
+        }
         try
         {
-            victim.gameObject.SetActive(true);
-            if (!native) victim.PatrollingData.Unpause();
-            victim.PostActivate();
-            if (native) NativeGhostSystem.ResyncAfterWake(victim);
+            using (TransitionPerformance.Measure(TransitionPhase.GhostDeathRestore))
+            {
+                using (TransitionPerformance.Measure(TransitionPhase.WakeBody))
+                    victim.gameObject.SetActive(true);
+                if (!native) victim.PatrollingData.Unpause();
+                victim.PostActivate();
+                if (native) NativeGhostSystem.ResyncAfterWake(victim);
+            }
             Log.Info($"GHOST SKIRMISH: vanilla {victim.GetPlayer?.Profile?.Nickname} killed in action by {killer?.Profile?.Nickname ?? "?"}");
             KillWithAttribution(victim.GetPlayer, killer);
         }
@@ -2418,6 +2526,12 @@ public partial class DormancySystem
         foreach (var kv in _vanillaGroups)
         {
             var group = kv.Value;
+            if (IsWaking(kv.Key))
+            {
+                var pendingReason = VanillaWakeReason(kv.Key, group, proximity: false);
+                if (pendingReason.HasValue) WakeVanillaGroup(kv.Key, group, pendingReason.Value);
+                continue;
+            }
             var dormant = 0;
             for (var i = 0; i < group.Count; i++)
                 if (_vanillaDormant.Contains(group[i])) dormant++;
@@ -2446,6 +2560,7 @@ public partial class DormancySystem
 
     private bool CanVanillaSleep(object key, List<BotOwner> group, bool joining = false)
     {
+        if (IsWaking(key)) return false;
         if (_vanillaSleepAllowedAt.TryGetValue(key, out var allowedAt) && Time.time < allowedAt)
             return NativeGhostDiagnostics.Refuse(group[0], "wake-cooldown", groupSize: group.Count);
 
@@ -2505,11 +2620,13 @@ public partial class DormancySystem
             if (!reason.HasValue && InScopedView(player.Position, out var scopeDist)) reason = new(GhostWakeCause.ScopedView, $"in scoped view at {scopeDist:F0}m");
             if (!reason.HasValue && proximity && awakeBotTriggerArmed && AnyAwakeBotNear(player.Position, null)) reason = new(GhostWakeCause.BotProximity, $"awake bot near {player.Profile?.Nickname}");
         }
-        return reason;
+        return reason ?? PreWakeReason(key, group);
     }
 
     private void SleepVanillaGroup(object key, List<BotOwner> group)
     {
+        if (IsWaking(key)) return;
+        using var timing = TransitionPerformance.Measure(TransitionPhase.SleepGroup);
         var native = _cfg.NativeGhostMovement && GhostMovementEnabled;
         var joining = VanillaDormantCount(group) > 0;
         var added = 0;
@@ -2528,7 +2645,8 @@ public partial class DormancySystem
                     bot.Memory.GoalEnemy = null;
                     bot.PatrollingData.Pause();
                 }
-                bot.gameObject.SetActive(false);
+                using (TransitionPerformance.Measure(TransitionPhase.SleepBody))
+                    bot.gameObject.SetActive(false);
             }
             catch (System.Exception e)
             {
@@ -2542,6 +2660,7 @@ public partial class DormancySystem
             _vanillaDormant.Add(bot);
             _vanillaHpBaseline[bot] = VanillaHp(bot);
             DormantProfileIds.Add(bot.GetPlayer.ProfileId);
+            PerformanceJournal.Event("sleep", bot.ProfileId);
             FinishSpawnProtection(bot);
             added++;
         }
@@ -2558,17 +2677,32 @@ public partial class DormancySystem
 
     private void WakeVanillaGroup(object key, List<BotOwner> group, GhostWakeReason reason)
     {
-        for (var i = 0; i < group.Count; i++)
-            WakeVanillaBot(group[i]);
-        _vanillaSleepAllowedAt[key] = Time.time + reason.CooldownSeconds;
-        _windowWakes++;
-        RecordWake(reason.Cause);
-        Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) awake: {reason.Message} ({_vanillaDormant.Count} vanilla dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
+        if (TryStageWake(key, group, reason)) return;
+        CancelStagedWake(key);
+        _wakeFrameBudget.Urgent(Time.frameCount);
+        try
+        {
+            using var timing = TransitionPerformance.Measure(TransitionPhase.WakeGroup);
+            for (var i = 0; i < group.Count; i++)
+                WakeVanillaBotWithReason(group[i], reason);
+            _vanillaSleepAllowedAt[key] = Time.time + reason.CooldownSeconds;
+            _windowWakes++;
+            RecordWake(reason.Cause);
+            Log.Info($"vanilla group ({group[0].GetPlayer?.Profile?.Nickname} +{group.Count - 1}) awake: {reason.Message} ({_vanillaDormant.Count} vanilla dormant) wakeCause={reason.Cause} retryAfter={reason.CooldownSeconds:F0}s");
+        }
+        finally { _wakeFrameBudget.Complete(System.Diagnostics.Stopwatch.GetTimestamp(), _cfg.WakeIntervalMs); }
     }
 
     private bool WakeVanillaBot(BotOwner bot)
     {
+        return WakeVanillaBotWithReason(bot, new(GhostWakeCause.GroupChanged, "ownership changed"));
+    }
+
+    private bool WakeVanillaBotWithReason(BotOwner bot, GhostWakeReason reason)
+    {
         if (!_vanillaDormant.Remove(bot)) return false;
+        GhostWakeActivationDiagnostics.Track(bot);
+        RecordWakeEvent(bot.GetPlayer, reason);
         var native = _nativeGhosts.Remove(bot);
         UnthrottleBrain(bot);
         DormantProfileIds.Remove(bot.GetPlayer.ProfileId);
@@ -2577,7 +2711,8 @@ public partial class DormancySystem
         if (bot.IsDead) { bot.gameObject.SetActive(true); return true; }
         try
         {
-            bot.gameObject.SetActive(true);
+            using (TransitionPerformance.Measure(TransitionPhase.WakeBody))
+                bot.gameObject.SetActive(true);
             if (!native) bot.PatrollingData.Unpause();
             bot.PostActivate();
             if (native) NativeGhostSystem.ResyncAfterWake(bot);
@@ -2598,6 +2733,7 @@ public partial class DormancySystem
 
     public void OnVanillaRemoved(BotOwner bot)
     {
+        ForgetStagedBot(bot);
         NativePatrolDiagnostics.Forget(bot);
         var dormant = _vanillaDormant.Remove(bot);
         _nativeGhosts.Remove(bot);
